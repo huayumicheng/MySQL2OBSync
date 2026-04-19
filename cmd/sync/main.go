@@ -26,7 +26,7 @@ func main() {
 	var (
 		configFile     = flag.String("c", "config.yaml", "配置文件路径")
 		compareOnly    = flag.Bool("compare-only", false, "仅执行数据对比，跳过同步")
-		countOnly      = flag.Bool("count-only", false, "仅对比数据量（行数），不对比内容")
+		countOnly      = flag.Bool("count-only", false, "仅对比数据量（行数），跳过同步且不采样对比内容")
 		tables         = flag.String("tables", "", "指定要同步/对比的表，逗号分隔")
 		showVersion    = flag.Bool("v", false, "显示版本信息")
 		createSchema   = flag.Bool("create-schema", false, "仅同步表结构（从源端拉取DDL并在目标端创建），不同步数据")
@@ -42,6 +42,10 @@ func main() {
 	if *showVersion {
 		fmt.Printf("MySQL to OceanBase(MySQL) Sync Tool v%s (built %s)\n", version, buildTime)
 		os.Exit(0)
+	}
+
+	if *countOnly {
+		*compareOnly = true
 	}
 
 	exePath, err := os.Executable()
