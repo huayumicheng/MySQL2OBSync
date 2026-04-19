@@ -7,6 +7,7 @@ import random
 import string
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from typing import List, Optional, Tuple
 
 import pymysql
 
@@ -20,14 +21,14 @@ class DBConfig:
     database: str
 
 
-def env_str(name: str, default: str | None = None) -> str:
+def env_str(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name, default)
     if v is None or v == "":
         raise SystemExit(f"missing env {name}")
     return v
 
 
-def env_int(name: str, default: int | None = None) -> int:
+def env_int(name: str, default: Optional[int] = None) -> int:
     v = os.getenv(name)
     if v is None or v == "":
         if default is None:
@@ -66,8 +67,8 @@ def unix_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
-def gen_rows_t1(count: int, base: datetime) -> list[tuple]:
-    rows: list[tuple] = []
+def gen_rows_t1(count: int, base: datetime) -> List[Tuple]:
+    rows: List[Tuple] = []
     for i in range(count):
         ct = base + timedelta(milliseconds=i * 10)
         info = f"info_{rand_str(20)}"
@@ -75,8 +76,8 @@ def gen_rows_t1(count: int, base: datetime) -> list[tuple]:
     return rows
 
 
-def gen_rows_t2(count: int, base: datetime) -> list[tuple]:
-    rows: list[tuple] = []
+def gen_rows_t2(count: int, base: datetime) -> List[Tuple]:
+    rows: List[Tuple] = []
     for i in range(count):
         ct = base + timedelta(milliseconds=i * 10)
         ct_ms = unix_ms(ct)
@@ -86,13 +87,13 @@ def gen_rows_t2(count: int, base: datetime) -> list[tuple]:
     return rows
 
 
-def chunked(seq: list[tuple], size: int) -> list[list[tuple]]:
+def chunked(seq: List[Tuple], size: int) -> List[List[Tuple]]:
     if size <= 0:
         raise SystemExit("batch-size must be > 0")
     return [seq[i : i + size] for i in range(0, len(seq), size)]
 
 
-def insert_rows(conn: pymysql.connections.Connection, table: str, rows: list[tuple], batch_size: int) -> int:
+def insert_rows(conn: pymysql.connections.Connection, table: str, rows: List[Tuple], batch_size: int) -> int:
     if table == "t1":
         sql = "INSERT INTO t1 (info, create_time) VALUES (%s, %s)"
     elif table == "t2":
