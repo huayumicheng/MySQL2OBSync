@@ -1,0 +1,64 @@
+version: "1.0"
+
+job_name: "mysql_to_obmysql_sync"
+
+source:
+  host: "127.0.0.1"
+  port: 3306
+  database: "source_db"
+  username: "root"
+  password: "${SOURCE_DB_PASSWORD}"
+  params:
+    charset: "utf8mb4"
+    parseTime: "true"
+    loc: "UTC"
+  max_open_conns: 20
+  max_idle_conns: 5
+  conn_max_lifetime: "1h"
+
+target:
+  host: "127.0.0.1"
+  port: 2881
+  database: "target_db"
+  username: "root"
+  password: "${TARGET_DB_PASSWORD}"
+  params:
+    charset: "utf8mb4"
+    parseTime: "true"
+    loc: "UTC"
+  max_open_conns: 50
+  max_idle_conns: 10
+  conn_max_lifetime: "1h"
+
+sync:
+  workers: 64
+  table_workers: 2
+  batch_size: 2000
+  read_buffer: 5000
+  channel_buffer: 10000
+  max_retries: 3
+  retry_interval: "5s"
+
+tables:
+  - source: "users"
+    target: "users"
+    split_column: "id"
+    truncate_before_sync: true
+    where: ""
+  - source: "orders"
+    target: "orders"
+    truncate_before_sync: true
+
+monitor:
+  report_interval: "10s"
+  log_level: "info"
+
+compare:
+  auto_compare: true
+  sample_rate: 0.01
+  compare_workers: 10
+  count_only: false
+
+schema:
+  strip_auto_increment: true
+
