@@ -132,7 +132,7 @@ password: "${SOURCE_DB_PASSWORD}"
 表项字段：
 - `source`：源表名（支持 `db.table` 或 `table`，建议与连接的 database 一致）
 - `target`：目标表名
-- `truncate_before_sync`：同步前是否清空目标表
+- `truncate_before_sync`：同步前是否清空目标表。为 false 且目标表已有数据时，会提示目标表行数并中止同步，避免误覆盖
 - `split_column`：分段字段（默认使用主键第一列）。仅当其为可扫描为整数的字段时才启用范围分段
 - `where`：额外过滤条件（直接拼到 SQL，需自行保证安全性与正确性）
 
