@@ -76,36 +76,114 @@ func isTargetNotEmptyError(err error) bool {
 	return errors.As(err, &many)
 }
 
-func (e *Engine) precheckTargetEmpty(tables []config.TableConfig) error {
-	var notEmpty []TargetTableNotEmptyError
+func isInteractiveStdin() bool {
+	fi, err := os.Stdin.Stat()
+	if err != nil {
+		return false
+	}
+	return (fi.Mode() & os.ModeCharDevice) != 0
+}
+
+type targetTableCount struct {
+	Table              string
+	Rows               int64
+	TruncateBeforeSync bool
+}
+
+func (e *Engine) precheckTargetTablesAndSelect(tables []config.TableConfig) ([]config.TableConfig, error) {
+	empty := make([]targetTableCount, 0, len(tables))
+	nonEmpty := make([]targetTableCount, 0, len(tables))
+
+	countByTarget := make(map[string]int64, len(tables))
+
 	for _, t := range tables {
-		if t.TruncateBeforeSync {
-			continue
-		}
 		cnt, err := database.GetTableRowCount(e.targetDB.DB, t.Target)
 		if err != nil {
-			return fmt.Errorf("precheck target row count failed for %s: %w", t.Target, err)
+			return nil, fmt.Errorf("precheck target row count failed for %s: %w", t.Target, err)
 		}
-		if cnt > 0 {
-			notEmpty = append(notEmpty, TargetTableNotEmptyError{
-				Table:  t.Target,
-				Count:  cnt,
-				Advice: "set truncate_before_sync: true to allow truncation or clean target data",
-			})
+		countByTarget[t.Target] = cnt
+		if cnt == 0 {
+			empty = append(empty, targetTableCount{Table: t.Target, Rows: cnt, TruncateBeforeSync: t.TruncateBeforeSync})
+		} else {
+			nonEmpty = append(nonEmpty, targetTableCount{Table: t.Target, Rows: cnt, TruncateBeforeSync: t.TruncateBeforeSync})
 		}
 	}
-	if len(notEmpty) == 0 {
-		return nil
+
+	logger.Info("\nTarget table row count precheck:")
+	if len(empty) > 0 {
+		logger.Info("  Empty tables:")
+		for _, s := range empty {
+			logger.Info("    - %s = %d", s.Table, s.Rows)
+		}
+	} else {
+		logger.Info("  Empty tables: (none)")
 	}
-	return &TargetTablesNotEmptyError{Tables: notEmpty}
+	if len(nonEmpty) > 0 {
+		logger.Info("  Non-empty tables:")
+		for _, s := range nonEmpty {
+			mark := "truncate_before_sync=false"
+			if s.TruncateBeforeSync {
+				mark = "truncate_before_sync=true"
+			}
+			logger.Info("    - %s = %d (%s)", s.Table, s.Rows, mark)
+		}
+	} else {
+		logger.Info("  Non-empty tables: (none)")
+	}
+
+	if len(nonEmpty) == 0 {
+		return tables, nil
+	}
+
+	if !isInteractiveStdin() {
+		return nil, fmt.Errorf("target has existing data, aborting sync (non-interactive mode)")
+	}
+
+	fmt.Fprintln(os.Stdout, "")
+	fmt.Fprintln(os.Stdout, "Target has existing data in some tables.")
+	fmt.Fprintln(os.Stdout, "Input NO to abort.")
+	fmt.Fprintln(os.Stdout, "Input YES to continue, then type confirm to start syncing the non-empty target table list.")
+	fmt.Fprint(os.Stdout, "Your choice (YES/NO): ")
+
+	var choice string
+	if _, err := fmt.Scanln(&choice); err != nil {
+		return nil, fmt.Errorf("read choice failed: %w", err)
+	}
+	choice = strings.TrimSpace(strings.ToLower(choice))
+	if choice == "no" {
+		return nil, fmt.Errorf("sync aborted by user")
+	}
+	if choice != "yes" {
+		return nil, fmt.Errorf("invalid choice: %s", choice)
+	}
+
+	selected := make([]config.TableConfig, 0, len(nonEmpty))
+	for _, t := range tables {
+		if countByTarget[t.Target] > 0 {
+			selected = append(selected, t)
+		}
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("no non-empty target tables to sync")
+	}
+
+	logger.Info("\nWill sync NON-EMPTY target tables (%d):", len(selected))
+	for _, t := range selected {
+		logger.Info("  - %s -> %s (target_rows=%d)", t.Source, t.Target, countByTarget[t.Target])
+	}
+
+	fmt.Fprint(os.Stdout, "Type confirm to start sync (or anything else to abort): ")
+	var confirm string
+	if _, err := fmt.Scanln(&confirm); err != nil {
+		return nil, fmt.Errorf("read confirm failed: %w", err)
+	}
+	if strings.TrimSpace(strings.ToLower(confirm)) != "confirm" {
+		return nil, fmt.Errorf("sync aborted by user")
+	}
+	return selected, nil
 }
 
 func (e *Engine) Run() error {
-	e.stats.Start()
-	if e.config.Monitor.ReportInterval != "" {
-		go e.stats.StartReporting(e.config.GetReportInterval())
-	}
-
 	tables := e.config.Tables
 	if len(tables) == 0 {
 		all, err := schema.NewDiscovery(e.sourceDB.DB).DiscoverAllTables()
@@ -120,17 +198,22 @@ func (e *Engine) Run() error {
 			})
 		}
 	}
-	e.stats.TotalTables = len(tables)
 
-	if err := e.precheckTargetEmpty(tables); err != nil {
-		e.stats.Stop()
+	selected, err := e.precheckTargetTablesAndSelect(tables)
+	if err != nil {
 		return err
 	}
 
-	if e.config.Sync.TableWorkers <= 1 {
-		return e.runSequential(tables)
+	e.stats.Start()
+	if e.config.Monitor.ReportInterval != "" {
+		go e.stats.StartReporting(e.config.GetReportInterval())
 	}
-	return e.runConcurrent(tables, e.config.Sync.TableWorkers)
+	e.stats.TotalTables = len(selected)
+
+	if e.config.Sync.TableWorkers <= 1 {
+		return e.runSequential(selected)
+	}
+	return e.runConcurrent(selected, e.config.Sync.TableWorkers)
 }
 
 func (e *Engine) runSequential(tables []config.TableConfig) error {
