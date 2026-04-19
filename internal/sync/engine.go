@@ -25,6 +25,8 @@ type Engine struct {
 	stats    *monitor.SyncStats
 	ctx      context.Context
 	cancel   context.CancelFunc
+
+	allowNonEmptyTargets map[string]struct{}
 }
 
 func NewEngine(cfg *config.Config, sourceDB, targetDB *database.Connection) *Engine {
@@ -180,6 +182,12 @@ func (e *Engine) precheckTargetTablesAndSelect(tables []config.TableConfig) ([]c
 	if strings.TrimSpace(strings.ToLower(confirm)) != "confirm" {
 		return nil, fmt.Errorf("sync aborted by user")
 	}
+
+	e.allowNonEmptyTargets = make(map[string]struct{}, len(selected))
+	for _, t := range selected {
+		e.allowNonEmptyTargets[t.Target] = struct{}{}
+	}
+
 	return selected, nil
 }
 
@@ -342,10 +350,22 @@ func (e *Engine) syncTable(tableConfig config.TableConfig, tableIndex int, total
 			return fmt.Errorf("get target row count failed: %w", err)
 		}
 		if cnt > 0 {
-			return &TargetTableNotEmptyError{
-				Table:  tableConfig.Target,
-				Count:  cnt,
-				Advice: "set truncate_before_sync: true to allow truncation or clean target data",
+			if e.allowNonEmptyTargets != nil {
+				if _, ok := e.allowNonEmptyTargets[tableConfig.Target]; ok {
+					logger.Warn("[%s] Target table not empty (%s=%d), continuing due to precheck confirmation", tableConfig.Source, tableConfig.Target, cnt)
+				} else {
+					return &TargetTableNotEmptyError{
+						Table:  tableConfig.Target,
+						Count:  cnt,
+						Advice: "set truncate_before_sync: true to allow truncation or clean target data",
+					}
+				}
+			} else {
+				return &TargetTableNotEmptyError{
+					Table:  tableConfig.Target,
+					Count:  cnt,
+					Advice: "set truncate_before_sync: true to allow truncation or clean target data",
+				}
 			}
 		}
 	}
