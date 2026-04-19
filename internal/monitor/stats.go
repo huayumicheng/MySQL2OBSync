@@ -25,6 +25,8 @@ type SyncStats struct {
 	mu             sync.RWMutex
 	lastSyncedRows int64
 	lastUpdateTime time.Time
+	stopOnce       sync.Once
+	stopCh         chan struct{}
 }
 
 type TableStats struct {
@@ -38,7 +40,7 @@ type TableStats struct {
 }
 
 func NewSyncStats() *SyncStats {
-	return &SyncStats{lastUpdateTime: time.Now()}
+	return &SyncStats{lastUpdateTime: time.Now(), stopCh: make(chan struct{})}
 }
 
 func (s *SyncStats) Start() {
@@ -48,6 +50,9 @@ func (s *SyncStats) Start() {
 
 func (s *SyncStats) Stop() {
 	s.EndTime = time.Now()
+	s.stopOnce.Do(func() {
+		close(s.stopCh)
+	})
 }
 
 func (s *SyncStats) StartTable(tableName string, totalRows int64) *TableStats {
@@ -203,8 +208,13 @@ func FormatNumber(n int64) string {
 func (s *SyncStats) StartReporting(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	for range ticker.C {
-		s.PrintProgress()
+	for {
+		select {
+		case <-ticker.C:
+			s.PrintProgress()
+		case <-s.stopCh:
+			return
+		}
 	}
 }
 
