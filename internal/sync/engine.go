@@ -144,8 +144,8 @@ func (e *Engine) precheckTargetTablesAndSelect(tables []config.TableConfig) ([]c
 	fmt.Fprintln(os.Stdout, "")
 	fmt.Fprintln(os.Stdout, "Target has existing data in some tables.")
 	fmt.Fprintln(os.Stdout, "Input NO to abort.")
-	fmt.Fprintln(os.Stdout, "Input YES to continue, then type confirm to start syncing the non-empty target table list.")
-	fmt.Fprint(os.Stdout, "Your choice (YES/NO): ")
+	fmt.Fprintln(os.Stdout, "Input YES_EMPTY to sync ONLY tables whose target row count is 0.")
+	fmt.Fprint(os.Stdout, "Your choice (YES_EMPTY/NO): ")
 
 	var choice string
 	if _, err := fmt.Scanln(&choice); err != nil {
@@ -155,38 +155,26 @@ func (e *Engine) precheckTargetTablesAndSelect(tables []config.TableConfig) ([]c
 	if choice == "no" {
 		return nil, fmt.Errorf("sync aborted by user")
 	}
-	if choice != "yes" {
+	if choice != "yes_empty" {
 		return nil, fmt.Errorf("invalid choice: %s", choice)
 	}
 
-	selected := make([]config.TableConfig, 0, len(nonEmpty))
+	selected := make([]config.TableConfig, 0, len(empty))
 	for _, t := range tables {
-		if countByTarget[t.Target] > 0 {
+		if countByTarget[t.Target] == 0 {
 			selected = append(selected, t)
 		}
 	}
 	if len(selected) == 0 {
-		return nil, fmt.Errorf("no non-empty target tables to sync")
+		return nil, fmt.Errorf("no empty target tables to sync")
 	}
 
-	logger.Info("\nWill sync NON-EMPTY target tables (%d):", len(selected))
+	logger.Info("\nWill sync EMPTY target tables (%d):", len(selected))
 	for _, t := range selected {
-		logger.Info("  - %s -> %s (target_rows=%d)", t.Source, t.Target, countByTarget[t.Target])
+		logger.Info("  - %s -> %s", t.Source, t.Target)
 	}
 
-	fmt.Fprint(os.Stdout, "Type confirm to start sync (or anything else to abort): ")
-	var confirm string
-	if _, err := fmt.Scanln(&confirm); err != nil {
-		return nil, fmt.Errorf("read confirm failed: %w", err)
-	}
-	if strings.TrimSpace(strings.ToLower(confirm)) != "confirm" {
-		return nil, fmt.Errorf("sync aborted by user")
-	}
-
-	e.allowNonEmptyTargets = make(map[string]struct{}, len(selected))
-	for _, t := range selected {
-		e.allowNonEmptyTargets[t.Target] = struct{}{}
-	}
+	e.allowNonEmptyTargets = nil
 
 	return selected, nil
 }
