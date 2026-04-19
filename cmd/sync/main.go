@@ -26,7 +26,7 @@ func main() {
 	var (
 		configFile     = flag.String("c", "config.yaml", "配置文件路径")
 		compareOnly    = flag.Bool("compare-only", false, "仅执行数据对比，跳过同步")
-		countOnly      = flag.Bool("count-only", false, "仅对比数据量（行数），跳过同步且不采样对比内容")
+		countOnly      = flag.Bool("count-only", false, "仅对比数据量（行数），跳过同步")
 		tables         = flag.String("tables", "", "指定要同步/对比的表，逗号分隔")
 		showVersion    = flag.Bool("v", false, "显示版本信息")
 		createSchema   = flag.Bool("create-schema", false, "仅同步表结构（从源端拉取DDL并在目标端创建），不同步数据")
@@ -73,6 +73,9 @@ func main() {
 	}
 	if *countOnly {
 		cfg.Compare.CountOnly = true
+	}
+	if *compareOnly && !*countOnly {
+		cfg.Compare.CountOnly = false
 	}
 
 	logger.Info("MySQL to OceanBase(MySQL) Sync Tool v%s", version)
@@ -172,11 +175,11 @@ func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection) {
 	tablePairs := make([]compare.TablePair, 0, len(cfg.Tables))
 	for _, t := range cfg.Tables {
 		tablePairs = append(tablePairs, compare.TablePair{
-			Source:        t.Source,
-			Target:        t.Target,
-			SampleRate:    cfg.Compare.SampleRate,
-			CountOnly:     cfg.Compare.CountOnly,
-			MaxSampleRows: cfg.Compare.GetMaxSampleRows(),
+			Source:      t.Source,
+			Target:      t.Target,
+			SplitColumn: t.SplitColumn,
+			CountOnly:   cfg.Compare.CountOnly,
+			BatchKeys:   cfg.Compare.BatchKeys,
 		})
 	}
 
@@ -189,11 +192,10 @@ func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection) {
 		}
 		for _, t := range tables {
 			tablePairs = append(tablePairs, compare.TablePair{
-				Source:        t,
-				Target:        t,
-				SampleRate:    cfg.Compare.SampleRate,
-				CountOnly:     cfg.Compare.CountOnly,
-				MaxSampleRows: cfg.Compare.GetMaxSampleRows(),
+				Source:    t,
+				Target:    t,
+				CountOnly: cfg.Compare.CountOnly,
+				BatchKeys: cfg.Compare.BatchKeys,
 			})
 		}
 	}

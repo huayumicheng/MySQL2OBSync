@@ -15,7 +15,7 @@ MySQL2OBSync-main/
 │   ├── database/             # MySQL 连接与通用操作（count/truncate/pk range/retry）
 │   ├── schema/               # schema 同步（SHOW CREATE TABLE）、结构校验
 │   ├── sync/                 # 同步引擎（并发、分段、批量写入）
-│   ├── compare/              # 数据对比（count + sample + no pk/uk）
+│   ├── compare/              # 数据对比（count + 全量一致性校验）
 │   ├── monitor/              # 进度统计输出
 │   └── logger/               # 日志（stdout + 文件）
 └── config/example.yaml       # 配置示例
@@ -71,7 +71,7 @@ go build -o mysql2ob-sync ./cmd/sync
 只比行数：
 
 ```bash
-./mysql2ob-sync -c config.yaml --compare-only --count-only
+./mysql2ob-sync -c config.yaml --count-only
 ```
 
 ### 5) 校验源端与目标端表结构
@@ -90,8 +90,8 @@ go build -o mysql2ob-sync ./cmd/sync
 - `--dry-run`：配合 `--create-schema`，只输出/生成 DDL，不执行
 - `--gen-script`：配合 `--create-schema`，把 DDL 生成到指定文件
 - `--validate-schema`：对比源端与目标端的表结构差异
-- `--compare-only`：仅做数据对比
-- `--count-only`：对比时只比行数（跳过抽样内容对比）
+- `--compare-only`：仅做数据对比（全量一致性校验，不做数据同步）
+- `--count-only`：仅对比行数（不做数据同步）
 - `-v`：显示版本
 
 ## 配置文件说明（config.yaml）
@@ -140,9 +140,9 @@ password: "${SOURCE_DB_PASSWORD}"
 
 - `auto_compare`：同步完成后自动执行对比
 - `compare_workers`：对比并发度
-- `sample_rate`：抽样率（默认 1%）
-- `max_sample_rows`：单表最多抽样行数上限（默认 10000；设为 0 表示不限制）
 - `count_only`：只比行数
+- `batch_keys`：全量比对时每批处理的 key 数（默认 1000）
+- 无主键/唯一键的表：需要在 `tables` 里配置 `split_column`，对比时会按该列分批做全量一致性校验
 
 ### schema
 

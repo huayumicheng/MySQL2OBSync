@@ -63,11 +63,10 @@ type MonitorConfig struct {
 }
 
 type CompareConfig struct {
-	AutoCompare    bool    `yaml:"auto_compare"`
-	SampleRate     float64 `yaml:"sample_rate"`
-	CompareWorkers int     `yaml:"compare_workers"`
-	CountOnly      bool    `yaml:"count_only"`
-	MaxSampleRows  *int    `yaml:"max_sample_rows"`
+	AutoCompare    bool `yaml:"auto_compare"`
+	CompareWorkers int  `yaml:"compare_workers"`
+	CountOnly      bool `yaml:"count_only"`
+	BatchKeys      int  `yaml:"batch_keys"`
 }
 
 type SchemaConfig struct {
@@ -136,15 +135,11 @@ func (c *Config) setDefaults() {
 	if c.Monitor.LogLevel == "" {
 		c.Monitor.LogLevel = "info"
 	}
-	if c.Compare.SampleRate == 0 {
-		c.Compare.SampleRate = 0.01
-	}
-	if c.Compare.MaxSampleRows == nil {
-		v := 10000
-		c.Compare.MaxSampleRows = &v
-	}
 	if c.Compare.CompareWorkers == 0 {
 		c.Compare.CompareWorkers = 10
+	}
+	if c.Compare.BatchKeys == 0 {
+		c.Compare.BatchKeys = 1000
 	}
 	if c.Source.MaxOpenConns == 0 {
 		c.Source.MaxOpenConns = 20
@@ -158,13 +153,6 @@ func (c *Config) setDefaults() {
 	if c.Target.MaxIdleConns == 0 {
 		c.Target.MaxIdleConns = 10
 	}
-}
-
-func (c *CompareConfig) GetMaxSampleRows() int {
-	if c.MaxSampleRows == nil {
-		return 10000
-	}
-	return *c.MaxSampleRows
 }
 
 func (c *Config) validate() error {

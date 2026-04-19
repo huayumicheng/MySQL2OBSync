@@ -3,12 +3,9 @@ package compare
 import (
 	"database/sql"
 	"fmt"
-	"math/rand"
-	"reflect"
 	"sort"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/huayumicheng/MySQL2OBSync/internal/database"
@@ -39,37 +36,27 @@ type ColumnMinMax struct {
 }
 
 type CompareResult struct {
-	SourceTable      string
-	TargetTable      string
-	SourceCount      int64
-	TargetCount      int64
-	CountMatch       bool
-	SampledRows      int64
-	MatchedRows      int64
-	MismatchedRows   int64
-	SourceOnlyRows   int64
-	TargetOnlyRows   int64
-	Errors           []string
-	SampleMismatches []MismatchDetail
-	NoPKUK           bool
-	ColumnStats      []ColumnMinMax
-}
-
-type MismatchDetail struct {
-	Key        string
-	KeyColumns []string
-	KeyType    string
-	SourceData map[string]interface{}
-	TargetData map[string]interface{}
-	DiffCols   []string
+	SourceTable    string
+	TargetTable    string
+	SourceCount    int64
+	TargetCount    int64
+	CountMatch     bool
+	KeyColumn      string
+	KeyType        string
+	ComparedKeys   int64
+	MatchedKeys    int64
+	MismatchedKeys int64
+	SourceOnlyKeys int64
+	TargetOnlyKeys int64
+	Errors         []string
 }
 
 type TablePair struct {
-	Source        string
-	Target        string
-	SampleRate    float64
-	CountOnly     bool
-	MaxSampleRows int
+	Source      string
+	Target      string
+	SplitColumn string
+	CountOnly   bool
+	BatchKeys   int
 }
 
 func (c *Comparator) CompareTables(tables []TablePair) ([]CompareResult, error) {
@@ -86,7 +73,7 @@ func (c *Comparator) CompareTables(tables []TablePair) ([]CompareResult, error) 
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			result, err := c.CompareTable(t.Source, t.Target, t.SampleRate, t.CountOnly, t.MaxSampleRows)
+			result, err := c.CompareTable(t)
 			if err != nil {
 				result.Errors = append(result.Errors, err.Error())
 			}
@@ -101,12 +88,12 @@ func (c *Comparator) CompareTables(tables []TablePair) ([]CompareResult, error) 
 	return results, nil
 }
 
-func (c *Comparator) CompareTable(sourceTable, targetTable string, sampleRate float64, countOnly bool, maxSampleRows int) (CompareResult, error) {
-	result := CompareResult{SourceTable: sourceTable, TargetTable: targetTable}
+func (c *Comparator) CompareTable(t TablePair) (CompareResult, error) {
+	result := CompareResult{SourceTable: t.Source, TargetTable: t.Target}
 
-	logger.Info("\nComparing table: %s <-> %s", sourceTable, targetTable)
+	logger.Info("\nComparing table: %s <-> %s", t.Source, t.Target)
 
-	sourceCount, targetCount, countMatch, err := c.compareRowCount(sourceTable, targetTable)
+	sourceCount, targetCount, countMatch, err := c.compareRowCount(t.Source, t.Target)
 	if err != nil {
 		return result, err
 	}
@@ -114,37 +101,115 @@ func (c *Comparator) CompareTable(sourceTable, targetTable string, sampleRate fl
 	result.TargetCount = targetCount
 	result.CountMatch = countMatch
 
-	logger.Info("  [%s] Source count: %d, Target count: %d, Match: %v", sourceTable, sourceCount, targetCount, countMatch)
+	logger.Info("  [%s] Source count: %d, Target count: %d, Match: %v", t.Source, sourceCount, targetCount, countMatch)
 	if !countMatch {
 		logger.Warn("  WARNING: Row count mismatch!")
 	}
-	if countOnly {
-		logger.Info("  [%s] Count-only mode, skipping data content comparison", sourceTable)
+	if t.CountOnly {
+		logger.Info("  [%s] Count-only mode, skipping data content comparison", t.Source)
 		return result, nil
 	}
 
-	if sampleRate > 0 && sourceCount > 0 {
-		sampleResult, err := c.sampleCompare(sourceTable, targetTable, sampleRate, maxSampleRows)
+	if sourceCount == 0 && targetCount == 0 {
+		return result, nil
+	}
+
+	if err := c.fullCompareByKeyColumn(&result, t); err != nil {
+		return result, err
+	}
+	return result, nil
+}
+
+type aggStat struct {
+	cnt    int64
+	sumCrc int64
+	xorCrc int64
+}
+
+func (c *Comparator) fullCompareByKeyColumn(result *CompareResult, t TablePair) error {
+	keyCols, keyType, err := c.getUniqueKey(t.Source)
+	keyCol := ""
+	if err == nil && len(keyCols) == 1 {
+		keyCol = keyCols[0]
+	}
+	if keyCol == "" {
+		if strings.TrimSpace(t.SplitColumn) == "" {
+			return fmt.Errorf("no PK/UK (single column) found and split_column is empty: table=%s", t.Source)
+		}
+		keyCol = t.SplitColumn
+		keyType = "SPLIT_COLUMN"
+	}
+
+	if t.BatchKeys <= 0 {
+		t.BatchKeys = 1000
+	}
+
+	srcCols, err := c.getTableColumns(c.sourceDB.DB, t.Source)
+	if err != nil {
+		return err
+	}
+	tgtCols, err := c.getTableColumns(c.targetDB.DB, t.Target)
+	if err != nil {
+		return err
+	}
+	if !sameStringSliceCI(srcCols, tgtCols) {
+		return fmt.Errorf("column list mismatch between source and target: %s <-> %s", t.Source, t.Target)
+	}
+
+	rowExpr := buildRowExpr(srcCols)
+
+	result.KeyColumn = keyCol
+	result.KeyType = keyType
+
+	var last interface{} = nil
+	for {
+		keys, err := c.getDistinctKeys(t.Source, keyCol, last, t.BatchKeys)
 		if err != nil {
-			result.Errors = append(result.Errors, err.Error())
-		} else {
-			result.SampledRows = sampleResult.SampledRows
-			result.MatchedRows = sampleResult.MatchedRows
-			result.MismatchedRows = sampleResult.MismatchedRows
-			result.SourceOnlyRows = sampleResult.SourceOnlyRows
-			result.TargetOnlyRows = sampleResult.TargetOnlyRows
-			result.SampleMismatches = sampleResult.SampleMismatches
-			result.NoPKUK = sampleResult.NoPKUK
-			result.ColumnStats = sampleResult.ColumnStats
-			if sampleResult.NoPKUK {
-				logger.Info("  [%s] [NO_PK_UK] No primary/unique key - comparing row counts and column min/max only", sourceTable)
+			return err
+		}
+		if len(keys) == 0 {
+			break
+		}
+		last = keys[len(keys)-1]
+
+		srcAgg, err := c.getAggByKeys(c.sourceDB.DB, t.Source, keyCol, rowExpr, keys)
+		if err != nil {
+			return err
+		}
+		tgtAgg, err := c.getAggByKeys(c.targetDB.DB, t.Target, keyCol, rowExpr, keys)
+		if err != nil {
+			return err
+		}
+
+		for _, k := range keys {
+			kKey := normalizeValue(k)
+			kStr := fmt.Sprint(kKey)
+			sa, sok := srcAgg[kStr]
+			ta, tok := tgtAgg[kStr]
+			result.ComparedKeys++
+			if !sok && tok {
+				result.TargetOnlyKeys++
+				continue
+			}
+			if sok && !tok {
+				result.SourceOnlyKeys++
+				continue
+			}
+			if !sok && !tok {
+				continue
+			}
+			if sa.cnt == ta.cnt && sa.sumCrc == ta.sumCrc && sa.xorCrc == ta.xorCrc {
+				result.MatchedKeys++
 			} else {
-				logger.Info("  [%s] Sampled: %d, Matched: %d, Mismatched: %d", sourceTable, sampleResult.SampledRows, sampleResult.MatchedRows, sampleResult.MismatchedRows)
+				result.MismatchedKeys++
 			}
 		}
 	}
 
-	return result, nil
+	logger.Info("  [%s] Key=%s(%s) ComparedKeys=%d Matched=%d Mismatched=%d SourceOnly=%d TargetOnly=%d",
+		t.Source, keyCol, keyType, result.ComparedKeys, result.MatchedKeys, result.MismatchedKeys, result.SourceOnlyKeys, result.TargetOnlyKeys)
+
+	return nil
 }
 
 func (c *Comparator) compareRowCount(sourceTable, targetTable string) (int64, int64, bool, error) {
@@ -157,97 +222,6 @@ func (c *Comparator) compareRowCount(sourceTable, targetTable string) (int64, in
 		return sourceCount, 0, false, fmt.Errorf("get target row count failed: %w", err)
 	}
 	return sourceCount, targetCount, sourceCount == targetCount, nil
-}
-
-type SampleResult struct {
-	SampledRows      int64
-	MatchedRows      int64
-	MismatchedRows   int64
-	SourceOnlyRows   int64
-	TargetOnlyRows   int64
-	SampleMismatches []MismatchDetail
-	NoPKUK           bool
-	ColumnStats      []ColumnMinMax
-}
-
-func (c *Comparator) sampleCompare(sourceTable, targetTable string, sampleRate float64, maxSampleRows int) (SampleResult, error) {
-	result := SampleResult{}
-
-	keyColumns, keyType, err := c.getUniqueKey(sourceTable)
-	if err != nil {
-		return c.noPKUKCompare(sourceTable, targetTable)
-	}
-
-	sampleKeys, err := c.getSampleKeys(sourceTable, keyColumns, sampleRate, maxSampleRows)
-	if err != nil {
-		return result, err
-	}
-	result.SampledRows = int64(len(sampleKeys))
-	if len(sampleKeys) == 0 {
-		return result, nil
-	}
-
-	var matched, mismatched, sourceOnly, targetOnly int64
-	var mismatchesMu sync.Mutex
-	var sampleMismatches []MismatchDetail
-
-	tasks := make(chan []interface{}, len(sampleKeys))
-	var wg sync.WaitGroup
-
-	for i := 0; i < c.workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for keyValues := range tasks {
-				match, srcOnly, tgtOnly, diffCols, srcData, tgtData, err := c.compareRowByKey(sourceTable, targetTable, keyColumns, keyValues)
-				if err != nil {
-					continue
-				}
-				if srcOnly {
-					atomic.AddInt64(&sourceOnly, 1)
-					continue
-				}
-				if tgtOnly {
-					atomic.AddInt64(&targetOnly, 1)
-					continue
-				}
-				if match {
-					atomic.AddInt64(&matched, 1)
-				} else {
-					atomic.AddInt64(&mismatched, 1)
-					if len(sampleMismatches) < 5 {
-						mismatchesMu.Lock()
-						if len(sampleMismatches) < 5 {
-							keyStr := buildKeyString(keyColumns, keyValues)
-							sampleMismatches = append(sampleMismatches, MismatchDetail{
-								Key:        keyStr,
-								KeyColumns: keyColumns,
-								KeyType:    keyType,
-								SourceData: srcData,
-								TargetData: tgtData,
-								DiffCols:   diffCols,
-							})
-						}
-						mismatchesMu.Unlock()
-					}
-				}
-			}
-		}()
-	}
-
-	for _, key := range sampleKeys {
-		tasks <- key
-	}
-	close(tasks)
-	wg.Wait()
-
-	result.MatchedRows = matched
-	result.MismatchedRows = mismatched
-	result.SourceOnlyRows = sourceOnly
-	result.TargetOnlyRows = targetOnly
-	result.SampleMismatches = sampleMismatches
-
-	return result, nil
 }
 
 func (c *Comparator) getUniqueKey(table string) ([]string, string, error) {
@@ -340,175 +314,6 @@ func (c *Comparator) getFirstUniqueIndexColumns(db *sql.DB, table string) ([]str
 	}
 	return out, nil
 }
-
-func (c *Comparator) getSampleKeys(table string, keyColumns []string, sampleRate float64, maxSampleRows int) ([][]interface{}, error) {
-	totalRows := c.getApproxTableRows(c.sourceDB.DB, table)
-	if totalRows <= 0 {
-		cnt, err := database.GetTableRowCount(c.sourceDB.DB, table)
-		if err == nil {
-			totalRows = cnt
-		} else {
-			totalRows = 100000
-		}
-	}
-
-	sampleSize := int(float64(totalRows) * sampleRate)
-	if sampleSize < 1 {
-		sampleSize = 1
-	}
-	if maxSampleRows > 0 && sampleSize > maxSampleRows {
-		sampleSize = maxSampleRows
-	}
-
-	colList := make([]string, 0, len(keyColumns))
-	for _, c := range keyColumns {
-		colList = append(colList, database.QuoteIdent(c))
-	}
-
-	query := fmt.Sprintf("SELECT %s FROM %s ORDER BY RAND() LIMIT %d",
-		strings.Join(colList, ", "),
-		database.QuoteTable(table),
-		sampleSize,
-	)
-
-	rows, err := c.sourceDB.DB.Query(query)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	sampleKeys := make([][]interface{}, 0, sampleSize)
-	for rows.Next() {
-		keyValues := make([]interface{}, len(keyColumns))
-		valuePtrs := make([]interface{}, len(keyColumns))
-		for i := range keyValues {
-			valuePtrs[i] = &keyValues[i]
-		}
-		if err := rows.Scan(valuePtrs...); err != nil {
-			continue
-		}
-		sampleKeys = append(sampleKeys, keyValues)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	rand.Shuffle(len(sampleKeys), func(i, j int) {
-		sampleKeys[i], sampleKeys[j] = sampleKeys[j], sampleKeys[i]
-	})
-
-	return sampleKeys, nil
-}
-
-func (c *Comparator) getApproxTableRows(db *sql.DB, table string) int64 {
-	q := `
-		SELECT table_rows
-		FROM information_schema.tables
-		WHERE table_schema = DATABASE()
-		  AND table_name = ?
-	`
-	var rows sql.NullInt64
-	if err := db.QueryRow(q, table).Scan(&rows); err != nil {
-		return 0
-	}
-	if rows.Valid {
-		return rows.Int64
-	}
-	return 0
-}
-
-func (c *Comparator) compareRowByKey(sourceTable, targetTable string, keyColumns []string, keyValues []interface{}) (match, sourceOnly, targetOnly bool, diffCols []string, sourceData, targetData map[string]interface{}, err error) {
-	where := make([]string, 0, len(keyColumns))
-	for _, col := range keyColumns {
-		where = append(where, fmt.Sprintf("%s = ?", database.QuoteIdent(col)))
-	}
-	whereClause := strings.Join(where, " AND ")
-
-	srcRow, err := fetchOneRow(c.sourceDB.DB, sourceTable, whereClause, keyValues)
-	if err != nil {
-		return false, false, false, nil, nil, nil, err
-	}
-	tgtRow, err := fetchOneRow(c.targetDB.DB, targetTable, whereClause, keyValues)
-	if err != nil {
-		return false, false, false, nil, nil, nil, err
-	}
-
-	if srcRow == nil && tgtRow == nil {
-		return true, false, false, nil, nil, nil, nil
-	}
-	if srcRow != nil && tgtRow == nil {
-		return false, true, false, nil, srcRow, nil, nil
-	}
-	if srcRow == nil && tgtRow != nil {
-		return false, false, true, nil, nil, tgtRow, nil
-	}
-
-	diff := compareRowMaps(srcRow, tgtRow)
-	return len(diff) == 0, false, false, diff, srcRow, tgtRow, nil
-}
-
-func fetchOneRow(db *sql.DB, table string, whereClause string, args []interface{}) (map[string]interface{}, error) {
-	query := fmt.Sprintf("SELECT * FROM %s WHERE %s LIMIT 1", database.QuoteTable(table), whereClause)
-	rows, err := db.Query(query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-	if !rows.Next() {
-		return nil, nil
-	}
-	values := make([]interface{}, len(cols))
-	ptrs := make([]interface{}, len(cols))
-	for i := range values {
-		ptrs[i] = &values[i]
-	}
-	if err := rows.Scan(ptrs...); err != nil {
-		return nil, err
-	}
-	m := make(map[string]interface{}, len(cols))
-	for i, c := range cols {
-		m[c] = normalizeValue(values[i])
-	}
-	return m, nil
-}
-
-func compareRowMaps(a, b map[string]interface{}) []string {
-	keys := make(map[string]struct{}, len(a)+len(b))
-	for k := range a {
-		keys[strings.ToLower(k)] = struct{}{}
-	}
-	for k := range b {
-		keys[strings.ToLower(k)] = struct{}{}
-	}
-	var diff []string
-	for k := range keys {
-		av, aok := getByCI(a, k)
-		bv, bok := getByCI(b, k)
-		if !aok || !bok {
-			diff = append(diff, k)
-			continue
-		}
-		if !reflect.DeepEqual(av, bv) {
-			diff = append(diff, k)
-		}
-	}
-	sort.Strings(diff)
-	return diff
-}
-
-func getByCI(m map[string]interface{}, keyLower string) (interface{}, bool) {
-	for k, v := range m {
-		if strings.EqualFold(k, keyLower) {
-			return v, true
-		}
-	}
-	return nil, false
-}
-
 func normalizeValue(v interface{}) interface{} {
 	switch x := v.(type) {
 	case []byte:
@@ -518,48 +323,6 @@ func normalizeValue(v interface{}) interface{} {
 	default:
 		return v
 	}
-}
-
-func buildKeyString(cols []string, vals []interface{}) string {
-	parts := make([]string, 0, len(cols))
-	for i := range cols {
-		if i < len(vals) {
-			parts = append(parts, fmt.Sprintf("%s=%v", cols[i], normalizeValue(vals[i])))
-		}
-	}
-	return strings.Join(parts, ",")
-}
-
-func (c *Comparator) noPKUKCompare(sourceTable, targetTable string) (SampleResult, error) {
-	res := SampleResult{NoPKUK: true}
-
-	cols, err := c.getTableColumns(c.sourceDB.DB, sourceTable)
-	if err != nil {
-		return res, err
-	}
-
-	for _, col := range cols {
-		srcMin, srcMax, err1 := getMinMax(c.sourceDB.DB, sourceTable, col)
-		tgtMin, tgtMax, err2 := getMinMax(c.targetDB.DB, targetTable, col)
-		if err1 != nil || err2 != nil {
-			continue
-		}
-		srcMinN := normalizeValue(srcMin)
-		srcMaxN := normalizeValue(srcMax)
-		tgtMinN := normalizeValue(tgtMin)
-		tgtMaxN := normalizeValue(tgtMax)
-		res.ColumnStats = append(res.ColumnStats, ColumnMinMax{
-			ColumnName: col,
-			SourceMin:  srcMinN,
-			SourceMax:  srcMaxN,
-			TargetMin:  tgtMinN,
-			TargetMax:  tgtMaxN,
-			MinMatch:   reflect.DeepEqual(srcMinN, tgtMinN),
-			MaxMatch:   reflect.DeepEqual(srcMaxN, tgtMaxN),
-		})
-	}
-
-	return res, nil
 }
 
 func (c *Comparator) getTableColumns(db *sql.DB, table string) ([]string, error) {
@@ -586,17 +349,127 @@ func (c *Comparator) getTableColumns(db *sql.DB, table string) ([]string, error)
 	return cols, rows.Err()
 }
 
-func getMinMax(db *sql.DB, table string, col string) (interface{}, interface{}, error) {
-	q := fmt.Sprintf("SELECT MIN(%s), MAX(%s) FROM %s",
-		database.QuoteIdent(col),
-		database.QuoteIdent(col),
-		database.QuoteTable(table),
-	)
-	var minV, maxV interface{}
-	if err := db.QueryRow(q).Scan(&minV, &maxV); err != nil {
-		return nil, nil, err
+func buildRowExpr(cols []string) string {
+	parts := make([]string, 0, len(cols))
+	for _, col := range cols {
+		qc := database.QuoteIdent(col)
+		parts = append(parts, fmt.Sprintf("IFNULL(CAST(%s AS CHAR), 'NULL')", qc))
 	}
-	return minV, maxV, nil
+	return fmt.Sprintf("CONCAT_WS('#', %s)", strings.Join(parts, ", "))
+}
+
+func sameStringSliceCI(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	na := make([]string, len(a))
+	nb := make([]string, len(b))
+	for i := range a {
+		na[i] = strings.ToLower(strings.TrimSpace(a[i]))
+	}
+	for i := range b {
+		nb[i] = strings.ToLower(strings.TrimSpace(b[i]))
+	}
+	sort.Strings(na)
+	sort.Strings(nb)
+	for i := range na {
+		if na[i] != nb[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Comparator) getDistinctKeys(table string, keyCol string, last interface{}, limit int) ([]interface{}, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+
+	qc := database.QuoteIdent(keyCol)
+	qt := database.QuoteTable(table)
+
+	var (
+		query string
+		args  []interface{}
+	)
+	if last == nil {
+		query = fmt.Sprintf("SELECT DISTINCT %s FROM %s WHERE %s IS NOT NULL ORDER BY %s LIMIT ?", qc, qt, qc, qc)
+		args = []interface{}{limit}
+	} else {
+		query = fmt.Sprintf("SELECT DISTINCT %s FROM %s WHERE %s IS NOT NULL AND %s > ? ORDER BY %s LIMIT ?", qc, qt, qc, qc, qc)
+		args = []interface{}{last, limit}
+	}
+
+	rows, err := c.sourceDB.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]interface{}, 0, limit)
+	for rows.Next() {
+		var v interface{}
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Comparator) getAggByKeys(db *sql.DB, table string, keyCol string, rowExpr string, keys []interface{}) (map[string]aggStat, error) {
+	out := make(map[string]aggStat, len(keys))
+	if len(keys) == 0 {
+		return out, nil
+	}
+
+	qc := database.QuoteIdent(keyCol)
+	qt := database.QuoteTable(table)
+
+	ph := make([]string, 0, len(keys))
+	args := make([]interface{}, 0, len(keys))
+	for _, k := range keys {
+		ph = append(ph, "?")
+		args = append(args, k)
+	}
+
+	query := fmt.Sprintf(
+		"SELECT %s, COUNT(*) AS cnt, COALESCE(SUM(CRC32(%s)), 0) AS sum_crc, COALESCE(BIT_XOR(CRC32(%s)), 0) AS xor_crc FROM %s WHERE %s IN (%s) GROUP BY %s",
+		qc,
+		rowExpr,
+		rowExpr,
+		qt,
+		qc,
+		strings.Join(ph, ","),
+		qc,
+	)
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			k      interface{}
+			cnt    int64
+			sumCrc int64
+			xorCrc int64
+		)
+		if err := rows.Scan(&k, &cnt, &sumCrc, &xorCrc); err != nil {
+			return nil, err
+		}
+		ks := fmt.Sprint(normalizeValue(k))
+		out[ks] = aggStat{cnt: cnt, sumCrc: sumCrc, xorCrc: xorCrc}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func PrintCompareSummary(results []CompareResult) {
@@ -604,7 +477,7 @@ func PrintCompareSummary(results []CompareResult) {
 	for _, r := range results {
 		if len(r.Errors) > 0 {
 			errCount++
-		} else if r.CountMatch && r.MismatchedRows == 0 && r.SourceOnlyRows == 0 && r.TargetOnlyRows == 0 {
+		} else if r.CountMatch && r.MismatchedKeys == 0 && r.SourceOnlyKeys == 0 && r.TargetOnlyKeys == 0 {
 			ok++
 		} else {
 			warn++
@@ -617,23 +490,11 @@ func PrintCompareSummary(results []CompareResult) {
 		status := "OK"
 		if len(r.Errors) > 0 {
 			status = "ERROR"
-		} else if !r.CountMatch || r.MismatchedRows > 0 || r.SourceOnlyRows > 0 || r.TargetOnlyRows > 0 {
+		} else if !r.CountMatch || r.MismatchedKeys > 0 || r.SourceOnlyKeys > 0 || r.TargetOnlyKeys > 0 {
 			status = "WARN"
 		}
-		logger.Info("Table: %s -> %s [%s] Count: %d vs %d", r.SourceTable, r.TargetTable, status, r.SourceCount, r.TargetCount)
-		if len(r.SampleMismatches) > 0 {
-			for _, m := range r.SampleMismatches {
-				logger.Warn("  Mismatch key(%s): %s diff_cols=%v", m.KeyType, m.Key, m.DiffCols)
-			}
-		}
-		if r.NoPKUK && len(r.ColumnStats) > 0 {
-			for _, cs := range r.ColumnStats {
-				if !cs.MinMatch || !cs.MaxMatch {
-					logger.Warn("  Column %s MinMatch=%v MaxMatch=%v srcMin=%v tgtMin=%v srcMax=%v tgtMax=%v",
-						cs.ColumnName, cs.MinMatch, cs.MaxMatch, cs.SourceMin, cs.TargetMin, cs.SourceMax, cs.TargetMax)
-				}
-			}
-		}
+		logger.Info("Table: %s -> %s [%s] Count: %d vs %d Key: %s(%s) ComparedKeys=%d Mismatched=%d",
+			r.SourceTable, r.TargetTable, status, r.SourceCount, r.TargetCount, r.KeyColumn, r.KeyType, r.ComparedKeys, r.MismatchedKeys)
 		if len(r.Errors) > 0 {
 			for _, e := range r.Errors {
 				logger.Error("  Error: %s", e)

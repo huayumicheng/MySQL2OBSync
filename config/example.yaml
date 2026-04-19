@@ -55,10 +55,9 @@ monitor:
 
 compare:
   auto_compare: true
-  sample_rate: 0.01
-  max_sample_rows: 10000
   compare_workers: 10
   count_only: false
+  batch_keys: 1000
 
 schema:
   strip_auto_increment: true
