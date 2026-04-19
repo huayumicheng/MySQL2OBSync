@@ -3,6 +3,7 @@ package sync
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -38,8 +39,66 @@ func NewEngine(cfg *config.Config, sourceDB, targetDB *database.Connection) *Eng
 	}
 }
 
-func (e *Engine) Stop() { e.cancel() }
+func (e *Engine) Stop()                        { e.cancel() }
 func (e *Engine) GetStats() *monitor.SyncStats { return e.stats }
+
+type TargetTableNotEmptyError struct {
+	Table  string
+	Count  int64
+	Advice string
+}
+
+func (e *TargetTableNotEmptyError) Error() string {
+	if e.Advice != "" {
+		return fmt.Sprintf("target table not empty: %s rows=%d (%s)", e.Table, e.Count, e.Advice)
+	}
+	return fmt.Sprintf("target table not empty: %s rows=%d", e.Table, e.Count)
+}
+
+type TargetTablesNotEmptyError struct {
+	Tables []TargetTableNotEmptyError
+}
+
+func (e *TargetTablesNotEmptyError) Error() string {
+	parts := make([]string, 0, len(e.Tables))
+	for _, t := range e.Tables {
+		parts = append(parts, fmt.Sprintf("%s=%d", t.Table, t.Count))
+	}
+	return fmt.Sprintf("target has existing data, aborting sync: %s", strings.Join(parts, ", "))
+}
+
+func isTargetNotEmptyError(err error) bool {
+	var one *TargetTableNotEmptyError
+	if errors.As(err, &one) {
+		return true
+	}
+	var many *TargetTablesNotEmptyError
+	return errors.As(err, &many)
+}
+
+func (e *Engine) precheckTargetEmpty(tables []config.TableConfig) error {
+	var notEmpty []TargetTableNotEmptyError
+	for _, t := range tables {
+		if t.TruncateBeforeSync {
+			continue
+		}
+		cnt, err := database.GetTableRowCount(e.targetDB.DB, t.Target)
+		if err != nil {
+			return fmt.Errorf("precheck target row count failed for %s: %w", t.Target, err)
+		}
+		if cnt > 0 {
+			notEmpty = append(notEmpty, TargetTableNotEmptyError{
+				Table:  t.Target,
+				Count:  cnt,
+				Advice: "set truncate_before_sync: true to allow truncation or clean target data",
+			})
+		}
+	}
+	if len(notEmpty) == 0 {
+		return nil
+	}
+	return &TargetTablesNotEmptyError{Tables: notEmpty}
+}
 
 func (e *Engine) Run() error {
 	e.stats.Start()
@@ -63,6 +122,11 @@ func (e *Engine) Run() error {
 	}
 	e.stats.TotalTables = len(tables)
 
+	if err := e.precheckTargetEmpty(tables); err != nil {
+		e.stats.Stop()
+		return err
+	}
+
 	if e.config.Sync.TableWorkers <= 1 {
 		return e.runSequential(tables)
 	}
@@ -80,6 +144,11 @@ func (e *Engine) runSequential(tables []config.TableConfig) error {
 		if err := e.syncTable(table, i+1, len(tables)); err != nil {
 			logger.Error("  [%s] Table sync failed: %v", table.Source, err)
 			e.stats.RecordFailedTable(table.Source, err.Error())
+			if isTargetNotEmptyError(err) {
+				e.Stop()
+				e.stats.Stop()
+				return err
+			}
 		}
 	}
 	e.stats.Stop()
@@ -106,6 +175,8 @@ func (e *Engine) runConcurrent(tables []config.TableConfig, tableWorkers int) er
 	tableChan := make(chan config.TableConfig, len(tables))
 	tableIndex := int32(0)
 	totalTables := len(tables)
+	var fatalOnce sync.Once
+	var fatalErr error
 
 	for i := 0; i < tableWorkers; i++ {
 		wg.Add(1)
@@ -129,6 +200,13 @@ func (e *Engine) runConcurrent(tables []config.TableConfig, tableWorkers int) er
 				if err := e.syncTable(table, int(idx), totalTables); err != nil {
 					logger.Error("  [%s] Table sync failed: %v", table.Source, err)
 					e.stats.RecordFailedTable(table.Source, err.Error())
+					if isTargetNotEmptyError(err) {
+						fatalOnce.Do(func() {
+							fatalErr = err
+							e.Stop()
+						})
+						return
+					}
 				} else {
 					completed := atomic.LoadInt64(&e.stats.CompletedTables)
 					logger.Info("✓ Table %s completed (%d/%d)", table.Source, completed, totalTables)
@@ -146,7 +224,7 @@ func (e *Engine) runConcurrent(tables []config.TableConfig, tableWorkers int) er
 
 	wg.Wait()
 	e.stats.Stop()
-	return nil
+	return fatalErr
 }
 
 func (e *Engine) syncTable(tableConfig config.TableConfig, tableIndex int, totalTables int) error {
@@ -175,6 +253,18 @@ func (e *Engine) syncTable(tableConfig config.TableConfig, tableIndex int, total
 			return fmt.Errorf("truncate target table failed: %w", err)
 		}
 		logger.Info("[%s] Target table truncated", tableConfig.Source)
+	} else {
+		cnt, err := database.GetTableRowCount(e.targetDB.DB, tableConfig.Target)
+		if err != nil {
+			return fmt.Errorf("get target row count failed: %w", err)
+		}
+		if cnt > 0 {
+			return &TargetTableNotEmptyError{
+				Table:  tableConfig.Target,
+				Count:  cnt,
+				Advice: "set truncate_before_sync: true to allow truncation or clean target data",
+			}
+		}
 	}
 
 	splitColumn := tableConfig.SplitColumn
