@@ -172,10 +172,11 @@ func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection) {
 	tablePairs := make([]compare.TablePair, 0, len(cfg.Tables))
 	for _, t := range cfg.Tables {
 		tablePairs = append(tablePairs, compare.TablePair{
-			Source:     t.Source,
-			Target:     t.Target,
-			SampleRate: cfg.Compare.SampleRate,
-			CountOnly:  cfg.Compare.CountOnly,
+			Source:        t.Source,
+			Target:        t.Target,
+			SampleRate:    cfg.Compare.SampleRate,
+			CountOnly:     cfg.Compare.CountOnly,
+			MaxSampleRows: cfg.Compare.MaxSampleRows,
 		})
 	}
 
@@ -188,10 +189,11 @@ func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection) {
 		}
 		for _, t := range tables {
 			tablePairs = append(tablePairs, compare.TablePair{
-				Source:     t,
-				Target:     t,
-				SampleRate: cfg.Compare.SampleRate,
-				CountOnly:  cfg.Compare.CountOnly,
+				Source:        t,
+				Target:        t,
+				SampleRate:    cfg.Compare.SampleRate,
+				CountOnly:     cfg.Compare.CountOnly,
+				MaxSampleRows: cfg.Compare.MaxSampleRows,
 			})
 		}
 	}

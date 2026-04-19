@@ -65,10 +65,11 @@ type MismatchDetail struct {
 }
 
 type TablePair struct {
-	Source     string
-	Target     string
-	SampleRate float64
-	CountOnly  bool
+	Source        string
+	Target        string
+	SampleRate    float64
+	CountOnly     bool
+	MaxSampleRows int
 }
 
 func (c *Comparator) CompareTables(tables []TablePair) ([]CompareResult, error) {
@@ -85,7 +86,7 @@ func (c *Comparator) CompareTables(tables []TablePair) ([]CompareResult, error) 
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			result, err := c.CompareTable(t.Source, t.Target, t.SampleRate, t.CountOnly)
+			result, err := c.CompareTable(t.Source, t.Target, t.SampleRate, t.CountOnly, t.MaxSampleRows)
 			if err != nil {
 				result.Errors = append(result.Errors, err.Error())
 			}
@@ -100,7 +101,7 @@ func (c *Comparator) CompareTables(tables []TablePair) ([]CompareResult, error) 
 	return results, nil
 }
 
-func (c *Comparator) CompareTable(sourceTable, targetTable string, sampleRate float64, countOnly bool) (CompareResult, error) {
+func (c *Comparator) CompareTable(sourceTable, targetTable string, sampleRate float64, countOnly bool, maxSampleRows int) (CompareResult, error) {
 	result := CompareResult{SourceTable: sourceTable, TargetTable: targetTable}
 
 	logger.Info("\nComparing table: %s <-> %s", sourceTable, targetTable)
@@ -123,7 +124,7 @@ func (c *Comparator) CompareTable(sourceTable, targetTable string, sampleRate fl
 	}
 
 	if sampleRate > 0 && sourceCount > 0 {
-		sampleResult, err := c.sampleCompare(sourceTable, targetTable, sampleRate)
+		sampleResult, err := c.sampleCompare(sourceTable, targetTable, sampleRate, maxSampleRows)
 		if err != nil {
 			result.Errors = append(result.Errors, err.Error())
 		} else {
@@ -169,7 +170,7 @@ type SampleResult struct {
 	ColumnStats      []ColumnMinMax
 }
 
-func (c *Comparator) sampleCompare(sourceTable, targetTable string, sampleRate float64) (SampleResult, error) {
+func (c *Comparator) sampleCompare(sourceTable, targetTable string, sampleRate float64, maxSampleRows int) (SampleResult, error) {
 	result := SampleResult{}
 
 	keyColumns, keyType, err := c.getUniqueKey(sourceTable)
@@ -177,7 +178,7 @@ func (c *Comparator) sampleCompare(sourceTable, targetTable string, sampleRate f
 		return c.noPKUKCompare(sourceTable, targetTable)
 	}
 
-	sampleKeys, err := c.getSampleKeys(sourceTable, keyColumns, sampleRate)
+	sampleKeys, err := c.getSampleKeys(sourceTable, keyColumns, sampleRate, maxSampleRows)
 	if err != nil {
 		return result, err
 	}
@@ -340,7 +341,7 @@ func (c *Comparator) getFirstUniqueIndexColumns(db *sql.DB, table string) ([]str
 	return out, nil
 }
 
-func (c *Comparator) getSampleKeys(table string, keyColumns []string, sampleRate float64) ([][]interface{}, error) {
+func (c *Comparator) getSampleKeys(table string, keyColumns []string, sampleRate float64, maxSampleRows int) ([][]interface{}, error) {
 	totalRows := c.getApproxTableRows(c.sourceDB.DB, table)
 	if totalRows <= 0 {
 		cnt, err := database.GetTableRowCount(c.sourceDB.DB, table)
@@ -355,8 +356,8 @@ func (c *Comparator) getSampleKeys(table string, keyColumns []string, sampleRate
 	if sampleSize < 1 {
 		sampleSize = 1
 	}
-	if sampleSize > 10000 {
-		sampleSize = 10000
+	if maxSampleRows > 0 && sampleSize > maxSampleRows {
+		sampleSize = maxSampleRows
 	}
 
 	colList := make([]string, 0, len(keyColumns))

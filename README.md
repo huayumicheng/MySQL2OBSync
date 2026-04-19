@@ -141,6 +141,7 @@ password: "${SOURCE_DB_PASSWORD}"
 - `auto_compare`：同步完成后自动执行对比
 - `compare_workers`：对比并发度
 - `sample_rate`：抽样率（默认 1%）
+- `max_sample_rows`：单表最多抽样行数上限（默认 10000；设为 0 表示不限制）
 - `count_only`：只比行数
 
 ### schema

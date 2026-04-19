@@ -11,14 +11,14 @@ import (
 
 type Config struct {
 	Version string        `yaml:"version"`
-	JobName  string        `yaml:"job_name"`
-	Source   DBConfig       `yaml:"source"`
-	Target   DBConfig       `yaml:"target"`
-	Sync     SyncConfig     `yaml:"sync"`
-	Tables   []TableConfig  `yaml:"tables"`
-	Monitor  MonitorConfig  `yaml:"monitor"`
-	Compare  CompareConfig  `yaml:"compare"`
-	Schema   SchemaConfig   `yaml:"schema"`
+	JobName string        `yaml:"job_name"`
+	Source  DBConfig      `yaml:"source"`
+	Target  DBConfig      `yaml:"target"`
+	Sync    SyncConfig    `yaml:"sync"`
+	Tables  []TableConfig `yaml:"tables"`
+	Monitor MonitorConfig `yaml:"monitor"`
+	Compare CompareConfig `yaml:"compare"`
+	Schema  SchemaConfig  `yaml:"schema"`
 }
 
 type DBConfig struct {
@@ -67,6 +67,7 @@ type CompareConfig struct {
 	SampleRate     float64 `yaml:"sample_rate"`
 	CompareWorkers int     `yaml:"compare_workers"`
 	CountOnly      bool    `yaml:"count_only"`
+	MaxSampleRows  int     `yaml:"max_sample_rows"`
 }
 
 type SchemaConfig struct {
@@ -138,6 +139,9 @@ func (c *Config) setDefaults() {
 	if c.Compare.SampleRate == 0 {
 		c.Compare.SampleRate = 0.01
 	}
+	if c.Compare.MaxSampleRows == 0 {
+		c.Compare.MaxSampleRows = 10000
+	}
 	if c.Compare.CompareWorkers == 0 {
 		c.Compare.CompareWorkers = 10
 	}
@@ -200,4 +204,3 @@ func (c *DBConfig) GetConnMaxLifetime() time.Duration {
 	}
 	return d
 }
-
