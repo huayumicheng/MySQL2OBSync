@@ -1,0 +1,22 @@
+CREATE DATABASE IF NOT EXISTS sync_check DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+USE sync_check;
+
+CREATE TABLE IF NOT EXISTS sync_test_ai (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  biz_id VARCHAR(64) NOT NULL,
+  amount DECIMAL(12,2) NOT NULL DEFAULT 0,
+  create_time DATETIME(3) NOT NULL,
+  update_time DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+  PRIMARY KEY (id),
+  KEY idx_create_time (create_time),
+  KEY idx_biz_id (biz_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS sync_test_pk (
+  pk_id BIGINT UNSIGNED NOT NULL,
+  create_time DATETIME(3) NOT NULL,
+  payload VARCHAR(255) NOT NULL,
+  status TINYINT NOT NULL DEFAULT 0,
+  PRIMARY KEY (pk_id),
+  KEY idx_create_time (create_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
