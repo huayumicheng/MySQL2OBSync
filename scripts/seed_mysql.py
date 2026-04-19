@@ -67,6 +67,11 @@ def unix_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
+def snowflake_id(ts_ms: int, worker_id: int, seq: int) -> int:
+    epoch_ms = 1577836800000
+    return ((ts_ms - epoch_ms) << 22) | ((worker_id & 0x3FF) << 12) | (seq & 0xFFF)
+
+
 def gen_rows_t1(count: int, base: datetime) -> List[Tuple]:
     rows: List[Tuple] = []
     for i in range(count):
@@ -76,14 +81,15 @@ def gen_rows_t1(count: int, base: datetime) -> List[Tuple]:
     return rows
 
 
-def gen_rows_t2(count: int, base: datetime) -> List[Tuple]:
+def gen_rows_t2(count: int, base: datetime, worker_id: int) -> List[Tuple]:
     rows: List[Tuple] = []
     for i in range(count):
         ct = base + timedelta(milliseconds=i * 10)
         ct_ms = unix_ms(ct)
+        sid = snowflake_id(ct_ms, worker_id, i)
         info = f"info_{ct_ms}_{i}"
         status = i % 4
-        rows.append((to_mysql_naive(ct), info, status))
+        rows.append((sid, to_mysql_naive(ct), info, status))
     return rows
 
 
@@ -97,7 +103,7 @@ def insert_rows(conn: pymysql.connections.Connection, table: str, rows: List[Tup
     if table == "t1":
         sql = "INSERT INTO t1 (info, create_time) VALUES (%s, %s)"
     elif table == "t2":
-        sql = "INSERT INTO t2 (create_time, info, status) VALUES (%s, %s, %s)"
+        sql = "INSERT INTO t2 (id, create_time, info, status) VALUES (%s, %s, %s, %s)"
     else:
         raise SystemExit("unsupported table, use t1 or t2")
 
@@ -114,6 +120,7 @@ def main() -> int:
     parser.add_argument("--table", required=True, choices=["t1", "t2"])
     parser.add_argument("--count", required=True, type=int)
     parser.add_argument("--batch-size", type=int, default=2000)
+    parser.add_argument("--worker-id", type=int, default=env_int("MYSQL_WORKER_ID", 1))
     parser.add_argument("--host")
     parser.add_argument("--port", type=int)
     parser.add_argument("--user")
@@ -130,7 +137,7 @@ def main() -> int:
     if args.table == "t1":
         rows = gen_rows_t1(args.count, base)
     else:
-        rows = gen_rows_t2(args.count, base)
+        rows = gen_rows_t2(args.count, base, args.worker_id)
 
     conn = pymysql.connect(
         host=cfg.host,
