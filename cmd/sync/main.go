@@ -176,7 +176,7 @@ func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection) {
 			Target:        t.Target,
 			SampleRate:    cfg.Compare.SampleRate,
 			CountOnly:     cfg.Compare.CountOnly,
-			MaxSampleRows: cfg.Compare.MaxSampleRows,
+			MaxSampleRows: cfg.Compare.GetMaxSampleRows(),
 		})
 	}
 
@@ -193,7 +193,7 @@ func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection) {
 				Target:        t,
 				SampleRate:    cfg.Compare.SampleRate,
 				CountOnly:     cfg.Compare.CountOnly,
-				MaxSampleRows: cfg.Compare.MaxSampleRows,
+				MaxSampleRows: cfg.Compare.GetMaxSampleRows(),
 			})
 		}
 	}

@@ -67,7 +67,7 @@ type CompareConfig struct {
 	SampleRate     float64 `yaml:"sample_rate"`
 	CompareWorkers int     `yaml:"compare_workers"`
 	CountOnly      bool    `yaml:"count_only"`
-	MaxSampleRows  int     `yaml:"max_sample_rows"`
+	MaxSampleRows  *int    `yaml:"max_sample_rows"`
 }
 
 type SchemaConfig struct {
@@ -139,8 +139,9 @@ func (c *Config) setDefaults() {
 	if c.Compare.SampleRate == 0 {
 		c.Compare.SampleRate = 0.01
 	}
-	if c.Compare.MaxSampleRows == 0 {
-		c.Compare.MaxSampleRows = 10000
+	if c.Compare.MaxSampleRows == nil {
+		v := 10000
+		c.Compare.MaxSampleRows = &v
 	}
 	if c.Compare.CompareWorkers == 0 {
 		c.Compare.CompareWorkers = 10
@@ -157,6 +158,13 @@ func (c *Config) setDefaults() {
 	if c.Target.MaxIdleConns == 0 {
 		c.Target.MaxIdleConns = 10
 	}
+}
+
+func (c *CompareConfig) GetMaxSampleRows() int {
+	if c.MaxSampleRows == nil {
+		return 10000
+	}
+	return *c.MaxSampleRows
 }
 
 func (c *Config) validate() error {
