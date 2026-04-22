@@ -69,6 +69,26 @@ func (e *TargetTablesNotEmptyError) Error() string {
 	return fmt.Sprintf("target has existing data, aborting sync: %s", strings.Join(parts, ", "))
 }
 
+type TableSyncFailure struct {
+	Table string
+	Err   string
+}
+
+type SyncFailedTablesError struct {
+	Failures []TableSyncFailure
+}
+
+func (e *SyncFailedTablesError) Error() string {
+	if len(e.Failures) == 0 {
+		return "sync failed: unknown error"
+	}
+	parts := make([]string, 0, len(e.Failures))
+	for _, f := range e.Failures {
+		parts = append(parts, fmt.Sprintf("%s: %s", f.Table, f.Err))
+	}
+	return fmt.Sprintf("sync failed: %d table(s) failed: %s", len(e.Failures), strings.Join(parts, "; "))
+}
+
 func isTargetNotEmptyError(err error) bool {
 	var one *TargetTableNotEmptyError
 	if errors.As(err, &one) {
@@ -213,6 +233,7 @@ func (e *Engine) Run() error {
 }
 
 func (e *Engine) runSequential(tables []config.TableConfig) error {
+	var failures []TableSyncFailure
 	for i, table := range tables {
 		select {
 		case <-e.ctx.Done():
@@ -228,9 +249,13 @@ func (e *Engine) runSequential(tables []config.TableConfig) error {
 				e.stats.Stop()
 				return err
 			}
+			failures = append(failures, TableSyncFailure{Table: table.Source, Err: err.Error()})
 		}
 	}
 	e.stats.Stop()
+	if len(failures) > 0 {
+		return &SyncFailedTablesError{Failures: failures}
+	}
 	return nil
 }
 
@@ -256,6 +281,8 @@ func (e *Engine) runConcurrent(tables []config.TableConfig, tableWorkers int) er
 	totalTables := len(tables)
 	var fatalOnce sync.Once
 	var fatalErr error
+	var failedMu sync.Mutex
+	var failures []TableSyncFailure
 
 	for i := 0; i < tableWorkers; i++ {
 		wg.Add(1)
@@ -279,6 +306,9 @@ func (e *Engine) runConcurrent(tables []config.TableConfig, tableWorkers int) er
 				if err := e.syncTable(table, int(idx), totalTables); err != nil {
 					logger.Error("  [%s] Table sync failed: %v", table.Source, err)
 					e.stats.RecordFailedTable(table.Source, err.Error())
+					failedMu.Lock()
+					failures = append(failures, TableSyncFailure{Table: table.Source, Err: err.Error()})
+					failedMu.Unlock()
 					if isTargetNotEmptyError(err) {
 						fatalOnce.Do(func() {
 							fatalErr = err
@@ -303,7 +333,13 @@ func (e *Engine) runConcurrent(tables []config.TableConfig, tableWorkers int) er
 
 	wg.Wait()
 	e.stats.Stop()
-	return fatalErr
+	if fatalErr != nil {
+		return fatalErr
+	}
+	if len(failures) > 0 {
+		return &SyncFailedTablesError{Failures: failures}
+	}
+	return nil
 }
 
 func (e *Engine) syncTable(tableConfig config.TableConfig, tableIndex int, totalTables int) error {
@@ -503,7 +539,6 @@ func (e *Engine) syncTableWithSplit(tableConfig config.TableConfig, ts *schema.T
 		if err != nil && writerErr == nil {
 			writerErr = err
 			logger.Error("  [%s] Writer error detected: %v", tableConfig.Source, err)
-			e.stats.RecordFailedTable(tableConfig.Source, fmt.Sprintf("writer error: %v", err))
 		}
 	}
 
@@ -519,11 +554,15 @@ func (e *Engine) syncTableWithSplit(tableConfig config.TableConfig, ts *schema.T
 	}
 
 	if writerErr != nil {
-		logger.Error("  [%s] Table sync marked as failed due to writer error", tableConfig.Source)
-		return nil
+		return fmt.Errorf("writer error: %w", writerErr)
 	}
 
-	_ = readerErr
+	if len(failedTasks) > 0 {
+		readerErr = nil
+	}
+	if readerErr != nil {
+		return fmt.Errorf("reader error: %w", readerErr)
+	}
 	return nil
 }
 
@@ -568,8 +607,7 @@ func (e *Engine) syncTableSequential(tableConfig config.TableConfig, ts *schema.
 		if len(batch) >= e.config.Sync.BatchSize {
 			if err := e.insertBatch(tableConfig.Target, columns, batch); err != nil {
 				logger.Error("  [%s] Insert batch failed: %v", tableConfig.Source, err)
-				e.stats.RecordFailedTable(tableConfig.Source, fmt.Sprintf("insert batch failed: %v", err))
-				return nil
+				return err
 			}
 			e.stats.UpdateTableProgress(tableConfig.Source, int64(len(batch)))
 			batch = nil
@@ -580,8 +618,7 @@ func (e *Engine) syncTableSequential(tableConfig config.TableConfig, ts *schema.
 	if len(batch) > 0 {
 		if err := e.insertBatch(tableConfig.Target, columns, batch); err != nil {
 			logger.Error("  [%s] Insert final batch failed: %v", tableConfig.Source, err)
-			e.stats.RecordFailedTable(tableConfig.Source, fmt.Sprintf("insert final batch failed: %v", err))
-			return nil
+			return err
 		}
 		e.stats.UpdateTableProgress(tableConfig.Source, int64(len(batch)))
 	}
@@ -769,7 +806,6 @@ func (e *Engine) tableWriter(tableConfig config.TableConfig, columns []string, d
 		if err != nil {
 			writerErrors <- err
 			logger.Error("  [%s] Writer stopped due to error: %v", tableConfig.Source, err)
-			e.stats.RecordFailedTable(tableConfig.Source, fmt.Sprintf("insert failed: %v", err))
 			for remaining := range dataChan {
 				_ = remaining
 			}
