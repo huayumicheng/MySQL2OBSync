@@ -1,0 +1,7 @@
+/bin
+*/*.iml
+.DS_Store
+*/.idea
+deps.sh
+.idea/
+sync_diff_inspector/config/output/*
