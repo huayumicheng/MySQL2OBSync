@@ -146,6 +146,10 @@ password: "${SOURCE_DB_PASSWORD}"
 - `checkpoint_file`：对比 checkpoint 文件路径（默认 `.mysql2ob-sync.compare.checkpoint.json`）
 - 无主键/唯一键的表：需要在 `tables` 里配置 `split_column`，对比时会按该列分批做全量一致性校验
 
+订正 SQL 导出：
+- 命令行 `--export-fix-sql <dir>`：将差异对应的订正 SQL 输出到目录（仅生成，不会自动执行）
+- 生成策略：PK/UK 表使用 `REPLACE INTO`；无 PK/UK 且使用 `split_column` 的表按该列值生成 `DELETE + INSERT`（会重建该 split 值下的所有行）
+
 ### schema
 
 - `strip_auto_increment`：同步 DDL 时移除表尾部的 `AUTO_INCREMENT=xxx`（避免迁移时把历史自增值固化）

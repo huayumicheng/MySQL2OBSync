@@ -20,9 +20,10 @@ type Comparator struct {
 
 	drillThreshold int
 	checkpoints    *checkpointManager
+	fixSQL         *fixSQLWriter
 }
 
-func NewComparator(sourceDB, targetDB *database.Connection, workers int, checkpointFile string, drillThreshold int) *Comparator {
+func NewComparator(sourceDB, targetDB *database.Connection, workers int, checkpointFile string, drillThreshold int, exportFixSQLDir string) *Comparator {
 	if workers <= 0 {
 		workers = 10
 	}
@@ -33,7 +34,11 @@ func NewComparator(sourceDB, targetDB *database.Connection, workers int, checkpo
 	if err != nil {
 		logger.Warn("Failed to init compare checkpoint: %v", err)
 	}
-	return &Comparator{sourceDB: sourceDB, targetDB: targetDB, workers: workers, drillThreshold: drillThreshold, checkpoints: cp}
+	fw, err := newFixSQLWriter(exportFixSQLDir)
+	if err != nil {
+		logger.Warn("Failed to init fix sql writer: %v", err)
+	}
+	return &Comparator{sourceDB: sourceDB, targetDB: targetDB, workers: workers, drillThreshold: drillThreshold, checkpoints: cp, fixSQL: fw}
 }
 
 type ColumnMinMax struct {
@@ -71,6 +76,9 @@ type TablePair struct {
 }
 
 func (c *Comparator) CompareTables(tables []TablePair) ([]CompareResult, error) {
+	if c.fixSQL != nil {
+		defer c.fixSQL.Close()
+	}
 	if c.checkpoints != nil {
 		h, err := hashConfig(struct {
 			DrillThreshold int         `json:"drill_threshold"`
@@ -217,7 +225,7 @@ func (c *Comparator) chunkCompareByKeyColumn(result *CompareResult, t TablePair)
 		}
 		endKey := keys[len(keys)-1]
 
-		if err := c.compareChunkAndDrill(result, t, keyCol, keyType, rowExpr, last, endKey, keys, distinctKeys); err != nil {
+		if err := c.compareChunkAndDrillWithCols(result, t, keyCol, keyType, rowExpr, last, endKey, keys, distinctKeys, srcCols); err != nil {
 			return err
 		}
 		last = endKey
@@ -528,24 +536,7 @@ func (c *Comparator) getRangeAgg(db *sql.DB, table string, keyCol string, rowExp
 	return aggStat{cnt: cnt, sumCrc: sumCrc, xorCrc: xorCrc}, nil
 }
 
-func (c *Comparator) compareChunkAndDrill(result *CompareResult, t TablePair, keyCol string, keyType string, rowExpr string, startExclusive interface{}, endInclusive interface{}, keys []interface{}, distinct bool) error {
-	srcAgg, err := c.getRangeAgg(c.sourceDB.DB, t.Source, keyCol, rowExpr, startExclusive, endInclusive)
-	if err != nil {
-		return err
-	}
-	tgtAgg, err := c.getRangeAgg(c.targetDB.DB, t.Target, keyCol, rowExpr, startExclusive, endInclusive)
-	if err != nil {
-		return err
-	}
-	if srcAgg.cnt == tgtAgg.cnt && srcAgg.sumCrc == tgtAgg.sumCrc && srcAgg.xorCrc == tgtAgg.xorCrc {
-		result.ComparedKeys += int64(len(keys))
-		result.MatchedKeys += int64(len(keys))
-		return nil
-	}
-	return c.drillRange(result, t, keyCol, keyType, rowExpr, startExclusive, endInclusive, keys, distinct)
-}
-
-func (c *Comparator) drillRange(result *CompareResult, t TablePair, keyCol string, keyType string, rowExpr string, startExclusive interface{}, endInclusive interface{}, keys []interface{}, distinct bool) error {
+func (c *Comparator) drillRange(result *CompareResult, t TablePair, keyCol string, keyType string, rowExpr string, startExclusive interface{}, endInclusive interface{}, keys []interface{}, distinct bool, cols []string) error {
 	if len(keys) <= c.drillThreshold {
 		srcKeys := keys
 		tgtKeys, err := c.getKeysInRange(c.targetDB.DB, t.Target, keyCol, startExclusive, endInclusive, distinct)
@@ -586,6 +577,12 @@ func (c *Comparator) drillRange(result *CompareResult, t TablePair, keyCol strin
 			}
 			if sok && !tok {
 				result.SourceOnlyKeys++
+				if c.fixSQL != nil {
+					rows, err := c.fetchRowsByKey(c.sourceDB.DB, t.Source, cols, keyCol, keyMap[ks])
+					if err == nil {
+						c.fixSQL.WriteReplaceOrRebuild(t.Target, keyCol, keyType, cols, keyMap[ks], rows)
+					}
+				}
 				continue
 			}
 			if !sok && !tok {
@@ -595,6 +592,12 @@ func (c *Comparator) drillRange(result *CompareResult, t TablePair, keyCol strin
 				result.MatchedKeys++
 			} else {
 				result.MismatchedKeys++
+				if c.fixSQL != nil {
+					rows, err := c.fetchRowsByKey(c.sourceDB.DB, t.Source, cols, keyCol, keyMap[ks])
+					if err == nil {
+						c.fixSQL.WriteReplaceOrRebuild(t.Target, keyCol, keyType, cols, keyMap[ks], rows)
+					}
+				}
 			}
 		}
 		return nil
@@ -609,10 +612,27 @@ func (c *Comparator) drillRange(result *CompareResult, t TablePair, keyCol strin
 
 	pivot := leftKeys[len(leftKeys)-1]
 
-	if err := c.compareChunkAndDrill(result, t, keyCol, keyType, rowExpr, startExclusive, pivot, leftKeys, distinct); err != nil {
+	if err := c.compareChunkAndDrillWithCols(result, t, keyCol, keyType, rowExpr, startExclusive, pivot, leftKeys, distinct, cols); err != nil {
 		return err
 	}
-	return c.compareChunkAndDrill(result, t, keyCol, keyType, rowExpr, pivot, endInclusive, rightKeys, distinct)
+	return c.compareChunkAndDrillWithCols(result, t, keyCol, keyType, rowExpr, pivot, endInclusive, rightKeys, distinct, cols)
+}
+
+func (c *Comparator) compareChunkAndDrillWithCols(result *CompareResult, t TablePair, keyCol string, keyType string, rowExpr string, startExclusive interface{}, endInclusive interface{}, keys []interface{}, distinct bool, cols []string) error {
+	srcAgg, err := c.getRangeAgg(c.sourceDB.DB, t.Source, keyCol, rowExpr, startExclusive, endInclusive)
+	if err != nil {
+		return err
+	}
+	tgtAgg, err := c.getRangeAgg(c.targetDB.DB, t.Target, keyCol, rowExpr, startExclusive, endInclusive)
+	if err != nil {
+		return err
+	}
+	if srcAgg.cnt == tgtAgg.cnt && srcAgg.sumCrc == tgtAgg.sumCrc && srcAgg.xorCrc == tgtAgg.xorCrc {
+		result.ComparedKeys += int64(len(keys))
+		result.MatchedKeys += int64(len(keys))
+		return nil
+	}
+	return c.drillRange(result, t, keyCol, keyType, rowExpr, startExclusive, endInclusive, keys, distinct, cols)
 }
 
 func (c *Comparator) getTableColumns(db *sql.DB, table string) ([]string, error) {
@@ -755,6 +775,41 @@ func (c *Comparator) getAggByKeys(db *sql.DB, table string, keyCol string, rowEx
 		}
 		ks := fmt.Sprint(normalizeValue(k))
 		out[ks] = aggStat{cnt: cnt, sumCrc: sumCrc, xorCrc: xorCrc}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Comparator) fetchRowsByKey(db *sql.DB, table string, cols []string, keyCol string, key interface{}) ([][]interface{}, error) {
+	if len(cols) == 0 {
+		return nil, nil
+	}
+	quotedCols := make([]string, 0, len(cols))
+	for _, col := range cols {
+		quotedCols = append(quotedCols, database.QuoteIdent(col))
+	}
+	qc := database.QuoteIdent(keyCol)
+	qt := database.QuoteTable(table)
+	query := fmt.Sprintf("SELECT %s FROM %s WHERE %s = ?", strings.Join(quotedCols, ", "), qt, qc)
+	rows, err := db.Query(query, key)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([][]interface{}, 0)
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range values {
+			ptrs[i] = &values[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		out = append(out, values)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

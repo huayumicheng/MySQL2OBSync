@@ -27,6 +27,7 @@ func main() {
 		configFile     = flag.String("c", "config.yaml", "配置文件路径")
 		compareOnly    = flag.Bool("compare-only", false, "仅执行数据对比，跳过同步")
 		countOnly      = flag.Bool("count-only", false, "仅对比数据量（行数），跳过同步")
+		exportFixSQL   = flag.String("export-fix-sql", "", "导出订正SQL到目录（默认不启用；仅生成不执行）")
 		tables         = flag.String("tables", "", "指定要同步/对比的表，逗号分隔")
 		showVersion    = flag.Bool("v", false, "显示版本信息")
 		createSchema   = flag.Bool("create-schema", false, "仅同步表结构（从源端拉取DDL并在目标端创建），不同步数据")
@@ -114,7 +115,7 @@ func main() {
 	logger.Info("✓ Connected to target database")
 
 	if *compareOnly {
-		runCompare(cfg, sourceDB, targetDB)
+		runCompare(cfg, sourceDB, targetDB, *exportFixSQL)
 		return
 	}
 	if *createSchema {
@@ -126,10 +127,10 @@ func main() {
 		return
 	}
 
-	runSync(cfg, sourceDB, targetDB)
+	runSync(cfg, sourceDB, targetDB, *exportFixSQL)
 }
 
-func runSync(cfg *config.Config, sourceDB, targetDB *database.Connection) {
+func runSync(cfg *config.Config, sourceDB, targetDB *database.Connection, exportFixSQLDir string) {
 	logger.Info("\nStarting sync with %d workers, batch size: %d, table workers: %d",
 		cfg.Sync.Workers, cfg.Sync.BatchSize, cfg.Sync.TableWorkers)
 
@@ -163,13 +164,13 @@ func runSync(cfg *config.Config, sourceDB, targetDB *database.Connection) {
 
 	if cfg.Compare.AutoCompare {
 		logger.Info("\nRunning automatic data comparison...")
-		runCompare(cfg, sourceDB, targetDB)
+		runCompare(cfg, sourceDB, targetDB, exportFixSQLDir)
 	}
 
 	logger.Info("\n✓ Sync completed successfully!")
 }
 
-func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection) {
+func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection, exportFixSQLDir string) {
 	logger.Info("Starting data comparison...")
 
 	tablePairs := make([]compare.TablePair, 0, len(cfg.Tables))
@@ -200,7 +201,14 @@ func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection) {
 		}
 	}
 
-	comparator := compare.NewComparator(sourceDB, targetDB, cfg.Compare.CompareWorkers, cfg.Compare.CheckpointFile, cfg.Compare.DrillThreshold)
+	comparator := compare.NewComparator(
+		sourceDB,
+		targetDB,
+		cfg.Compare.CompareWorkers,
+		cfg.Compare.CheckpointFile,
+		cfg.Compare.DrillThreshold,
+		exportFixSQLDir,
+	)
 	results, err := comparator.CompareTables(tablePairs)
 	if err != nil {
 		logger.Fatal("Compare failed: %v", err)
