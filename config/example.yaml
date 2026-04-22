@@ -58,6 +58,8 @@ compare:
   compare_workers: 10
   count_only: false
   batch_keys: 1000
+  drill_threshold: 2000
+  checkpoint_file: ".mysql2ob-sync.compare.checkpoint.json"
 
 schema:
   strip_auto_increment: true

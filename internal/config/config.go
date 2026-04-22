@@ -63,10 +63,12 @@ type MonitorConfig struct {
 }
 
 type CompareConfig struct {
-	AutoCompare    bool `yaml:"auto_compare"`
-	CompareWorkers int  `yaml:"compare_workers"`
-	CountOnly      bool `yaml:"count_only"`
-	BatchKeys      int  `yaml:"batch_keys"`
+	AutoCompare    bool   `yaml:"auto_compare"`
+	CompareWorkers int    `yaml:"compare_workers"`
+	CountOnly      bool   `yaml:"count_only"`
+	BatchKeys      int    `yaml:"batch_keys"`
+	DrillThreshold int    `yaml:"drill_threshold"`
+	CheckpointFile string `yaml:"checkpoint_file"`
 }
 
 type SchemaConfig struct {
@@ -140,6 +142,12 @@ func (c *Config) setDefaults() {
 	}
 	if c.Compare.BatchKeys == 0 {
 		c.Compare.BatchKeys = 1000
+	}
+	if c.Compare.DrillThreshold == 0 {
+		c.Compare.DrillThreshold = 2000
+	}
+	if c.Compare.CheckpointFile == "" {
+		c.Compare.CheckpointFile = ".mysql2ob-sync.compare.checkpoint.json"
 	}
 	if c.Source.MaxOpenConns == 0 {
 		c.Source.MaxOpenConns = 20

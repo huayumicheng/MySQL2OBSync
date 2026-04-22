@@ -200,7 +200,7 @@ func runCompare(cfg *config.Config, sourceDB, targetDB *database.Connection) {
 		}
 	}
 
-	comparator := compare.NewComparator(sourceDB, targetDB, cfg.Compare.CompareWorkers)
+	comparator := compare.NewComparator(sourceDB, targetDB, cfg.Compare.CompareWorkers, cfg.Compare.CheckpointFile, cfg.Compare.DrillThreshold)
 	results, err := comparator.CompareTables(tablePairs)
 	if err != nil {
 		logger.Fatal("Compare failed: %v", err)

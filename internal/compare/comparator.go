@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,13 +17,23 @@ type Comparator struct {
 	sourceDB *database.Connection
 	targetDB *database.Connection
 	workers  int
+
+	drillThreshold int
+	checkpoints    *checkpointManager
 }
 
-func NewComparator(sourceDB, targetDB *database.Connection, workers int) *Comparator {
+func NewComparator(sourceDB, targetDB *database.Connection, workers int, checkpointFile string, drillThreshold int) *Comparator {
 	if workers <= 0 {
 		workers = 10
 	}
-	return &Comparator{sourceDB: sourceDB, targetDB: targetDB, workers: workers}
+	if drillThreshold <= 0 {
+		drillThreshold = 2000
+	}
+	cp, err := newCheckpointManager(checkpointFile)
+	if err != nil {
+		logger.Warn("Failed to init compare checkpoint: %v", err)
+	}
+	return &Comparator{sourceDB: sourceDB, targetDB: targetDB, workers: workers, drillThreshold: drillThreshold, checkpoints: cp}
 }
 
 type ColumnMinMax struct {
@@ -60,6 +71,20 @@ type TablePair struct {
 }
 
 func (c *Comparator) CompareTables(tables []TablePair) ([]CompareResult, error) {
+	if c.checkpoints != nil {
+		h, err := hashConfig(struct {
+			DrillThreshold int         `json:"drill_threshold"`
+			Tables         []TablePair `json:"tables"`
+		}{DrillThreshold: c.drillThreshold, Tables: tables})
+		if err == nil {
+			if err := c.checkpoints.init(h); err != nil {
+				logger.Warn("Failed to init compare checkpoint: %v", err)
+			}
+		} else {
+			logger.Warn("Failed to hash compare config: %v", err)
+		}
+	}
+
 	results := make([]CompareResult, 0, len(tables))
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -114,7 +139,7 @@ func (c *Comparator) CompareTable(t TablePair) (CompareResult, error) {
 		return result, nil
 	}
 
-	if err := c.fullCompareByKeyColumn(&result, t); err != nil {
+	if err := c.chunkCompareByKeyColumn(&result, t); err != nil {
 		return result, err
 	}
 	return result, nil
@@ -126,7 +151,7 @@ type aggStat struct {
 	xorCrc int64
 }
 
-func (c *Comparator) fullCompareByKeyColumn(result *CompareResult, t TablePair) error {
+func (c *Comparator) chunkCompareByKeyColumn(result *CompareResult, t TablePair) error {
 	keyCols, keyType, err := c.getUniqueKey(t.Source)
 	keyCol := ""
 	if err == nil && len(keyCols) == 1 {
@@ -161,53 +186,70 @@ func (c *Comparator) fullCompareByKeyColumn(result *CompareResult, t TablePair) 
 	result.KeyColumn = keyCol
 	result.KeyType = keyType
 
+	distinctKeys := keyType == "SPLIT_COLUMN"
+	colType, err := c.getColumnDataType(c.sourceDB.DB, t.Source, keyCol)
+	if err != nil {
+		return err
+	}
+
 	var last interface{} = nil
+	if c.checkpoints != nil {
+		if ck, ok := c.checkpoints.get(t.Source); ok && ck.Done && ck.KeyColumn == keyCol && ck.KeyType == keyType {
+			logger.Info("  [%s] Compare checkpoint done, skipping content comparison", t.Source)
+			return nil
+		}
+		if ck, ok := c.checkpoints.get(t.Source); ok && ck.LastKey != "" && ck.KeyColumn == keyCol && ck.KeyType == keyType {
+			v, err := parseCheckpointKey(ck.LastKey, colType)
+			if err == nil {
+				last = v
+				logger.Info("  [%s] Compare checkpoint resume from last_key=%s", t.Source, ck.LastKey)
+			}
+		}
+	}
+
 	for {
-		keys, err := c.getDistinctKeys(t.Source, keyCol, last, t.BatchKeys)
+		keys, err := c.getNextKeys(t.Source, keyCol, last, t.BatchKeys, distinctKeys)
 		if err != nil {
 			return err
 		}
 		if len(keys) == 0 {
 			break
 		}
-		last = keys[len(keys)-1]
+		endKey := keys[len(keys)-1]
 
-		srcAgg, err := c.getAggByKeys(c.sourceDB.DB, t.Source, keyCol, rowExpr, keys)
-		if err != nil {
+		if err := c.compareChunkAndDrill(result, t, keyCol, keyType, rowExpr, last, endKey, keys, distinctKeys); err != nil {
 			return err
 		}
-		tgtAgg, err := c.getAggByKeys(c.targetDB.DB, t.Target, keyCol, rowExpr, keys)
-		if err != nil {
-			return err
-		}
-
-		for _, k := range keys {
-			kKey := normalizeValue(k)
-			kStr := fmt.Sprint(kKey)
-			sa, sok := srcAgg[kStr]
-			ta, tok := tgtAgg[kStr]
-			result.ComparedKeys++
-			if !sok && tok {
-				result.TargetOnlyKeys++
-				continue
+		last = endKey
+		if c.checkpoints != nil {
+			lastKeyStr := ""
+			if last != nil {
+				lastKeyStr = fmt.Sprint(normalizeValue(last))
 			}
-			if sok && !tok {
-				result.SourceOnlyKeys++
-				continue
-			}
-			if !sok && !tok {
-				continue
-			}
-			if sa.cnt == ta.cnt && sa.sumCrc == ta.sumCrc && sa.xorCrc == ta.xorCrc {
-				result.MatchedKeys++
-			} else {
-				result.MismatchedKeys++
-			}
+			_ = c.checkpoints.set(t.Source, tableCheckpoint{
+				LastKey:   lastKeyStr,
+				Done:      false,
+				KeyColumn: keyCol,
+				KeyType:   keyType,
+			})
 		}
 	}
 
 	logger.Info("  [%s] Key=%s(%s) ComparedKeys=%d Matched=%d Mismatched=%d SourceOnly=%d TargetOnly=%d",
 		t.Source, keyCol, keyType, result.ComparedKeys, result.MatchedKeys, result.MismatchedKeys, result.SourceOnlyKeys, result.TargetOnlyKeys)
+
+	if c.checkpoints != nil {
+		lastKeyStr := ""
+		if last != nil {
+			lastKeyStr = fmt.Sprint(normalizeValue(last))
+		}
+		_ = c.checkpoints.set(t.Source, tableCheckpoint{
+			LastKey:   lastKeyStr,
+			Done:      true,
+			KeyColumn: keyCol,
+			KeyType:   keyType,
+		})
+	}
 
 	return nil
 }
@@ -323,6 +365,254 @@ func normalizeValue(v interface{}) interface{} {
 	default:
 		return v
 	}
+}
+
+func parseCheckpointKey(s string, colType string) (interface{}, error) {
+	ct := strings.ToLower(strings.TrimSpace(colType))
+	switch ct {
+	case "tinyint", "smallint", "mediumint", "int", "integer", "bigint", "year":
+		v, err := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		return v, nil
+	case "unsigned":
+		v, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		return int64(v), nil
+	case "datetime", "timestamp", "date", "time":
+		layout := "2006-01-02 15:04:05.000000"
+		t, err := time.ParseInLocation(layout, strings.TrimSpace(s), time.UTC)
+		if err != nil {
+			return nil, err
+		}
+		return t, nil
+	default:
+		return s, nil
+	}
+}
+
+func (c *Comparator) getColumnDataType(db *sql.DB, table string, col string) (string, error) {
+	q := `
+		SELECT data_type
+		FROM information_schema.columns
+		WHERE table_schema = DATABASE()
+		  AND table_name = ?
+		  AND column_name = ?
+	`
+	var dt string
+	if err := db.QueryRow(q, table, col).Scan(&dt); err != nil {
+		return "", err
+	}
+	return dt, nil
+}
+
+func (c *Comparator) getNextKeys(table string, keyCol string, last interface{}, limit int, distinct bool) ([]interface{}, error) {
+	if limit <= 0 {
+		limit = 1000
+	}
+	qc := database.QuoteIdent(keyCol)
+	qt := database.QuoteTable(table)
+	var (
+		query string
+		args  []interface{}
+	)
+	if last == nil {
+		if distinct {
+			query = fmt.Sprintf("SELECT DISTINCT %s FROM %s WHERE %s IS NOT NULL ORDER BY %s LIMIT ?", qc, qt, qc, qc)
+		} else {
+			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s IS NOT NULL ORDER BY %s LIMIT ?", qc, qt, qc, qc)
+		}
+		args = []interface{}{limit}
+	} else {
+		if distinct {
+			query = fmt.Sprintf("SELECT DISTINCT %s FROM %s WHERE %s IS NOT NULL AND %s > ? ORDER BY %s LIMIT ?", qc, qt, qc, qc, qc)
+		} else {
+			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s IS NOT NULL AND %s > ? ORDER BY %s LIMIT ?", qc, qt, qc, qc, qc)
+		}
+		args = []interface{}{last, limit}
+	}
+
+	rows, err := c.sourceDB.DB.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]interface{}, 0, limit)
+	for rows.Next() {
+		var v interface{}
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Comparator) getKeysInRange(db *sql.DB, table string, keyCol string, startExclusive interface{}, endInclusive interface{}, distinct bool) ([]interface{}, error) {
+	qc := database.QuoteIdent(keyCol)
+	qt := database.QuoteTable(table)
+
+	var (
+		query string
+		args  []interface{}
+	)
+	if startExclusive == nil {
+		if distinct {
+			query = fmt.Sprintf("SELECT DISTINCT %s FROM %s WHERE %s IS NOT NULL AND %s <= ? ORDER BY %s", qc, qt, qc, qc, qc)
+		} else {
+			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s IS NOT NULL AND %s <= ? ORDER BY %s", qc, qt, qc, qc, qc)
+		}
+		args = []interface{}{endInclusive}
+	} else {
+		if distinct {
+			query = fmt.Sprintf("SELECT DISTINCT %s FROM %s WHERE %s IS NOT NULL AND %s > ? AND %s <= ? ORDER BY %s", qc, qt, qc, qc, qc, qc)
+		} else {
+			query = fmt.Sprintf("SELECT %s FROM %s WHERE %s IS NOT NULL AND %s > ? AND %s <= ? ORDER BY %s", qc, qt, qc, qc, qc, qc)
+		}
+		args = []interface{}{startExclusive, endInclusive}
+	}
+
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]interface{}, 0)
+	for rows.Next() {
+		var v interface{}
+		if err := rows.Scan(&v); err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *Comparator) getRangeAgg(db *sql.DB, table string, keyCol string, rowExpr string, startExclusive interface{}, endInclusive interface{}) (aggStat, error) {
+	qc := database.QuoteIdent(keyCol)
+	qt := database.QuoteTable(table)
+
+	var (
+		query string
+		args  []interface{}
+	)
+	if startExclusive == nil {
+		query = fmt.Sprintf("SELECT COUNT(*) AS cnt, COALESCE(SUM(CRC32(%s)), 0) AS sum_crc, COALESCE(BIT_XOR(CRC32(%s)), 0) AS xor_crc FROM %s WHERE %s IS NOT NULL AND %s <= ?",
+			rowExpr, rowExpr, qt, qc, qc)
+		args = []interface{}{endInclusive}
+	} else {
+		query = fmt.Sprintf("SELECT COUNT(*) AS cnt, COALESCE(SUM(CRC32(%s)), 0) AS sum_crc, COALESCE(BIT_XOR(CRC32(%s)), 0) AS xor_crc FROM %s WHERE %s IS NOT NULL AND %s > ? AND %s <= ?",
+			rowExpr, rowExpr, qt, qc, qc, qc)
+		args = []interface{}{startExclusive, endInclusive}
+	}
+
+	var (
+		cnt    int64
+		sumCrc int64
+		xorCrc int64
+	)
+	if err := db.QueryRow(query, args...).Scan(&cnt, &sumCrc, &xorCrc); err != nil {
+		return aggStat{}, err
+	}
+	return aggStat{cnt: cnt, sumCrc: sumCrc, xorCrc: xorCrc}, nil
+}
+
+func (c *Comparator) compareChunkAndDrill(result *CompareResult, t TablePair, keyCol string, keyType string, rowExpr string, startExclusive interface{}, endInclusive interface{}, keys []interface{}, distinct bool) error {
+	srcAgg, err := c.getRangeAgg(c.sourceDB.DB, t.Source, keyCol, rowExpr, startExclusive, endInclusive)
+	if err != nil {
+		return err
+	}
+	tgtAgg, err := c.getRangeAgg(c.targetDB.DB, t.Target, keyCol, rowExpr, startExclusive, endInclusive)
+	if err != nil {
+		return err
+	}
+	if srcAgg.cnt == tgtAgg.cnt && srcAgg.sumCrc == tgtAgg.sumCrc && srcAgg.xorCrc == tgtAgg.xorCrc {
+		result.ComparedKeys += int64(len(keys))
+		result.MatchedKeys += int64(len(keys))
+		return nil
+	}
+	return c.drillRange(result, t, keyCol, keyType, rowExpr, startExclusive, endInclusive, keys, distinct)
+}
+
+func (c *Comparator) drillRange(result *CompareResult, t TablePair, keyCol string, keyType string, rowExpr string, startExclusive interface{}, endInclusive interface{}, keys []interface{}, distinct bool) error {
+	if len(keys) <= c.drillThreshold {
+		srcKeys := keys
+		tgtKeys, err := c.getKeysInRange(c.targetDB.DB, t.Target, keyCol, startExclusive, endInclusive, distinct)
+		if err != nil {
+			return err
+		}
+		keyMap := make(map[string]interface{}, len(srcKeys)+len(tgtKeys))
+		for _, k := range srcKeys {
+			keyMap[fmt.Sprint(normalizeValue(k))] = k
+		}
+		for _, k := range tgtKeys {
+			ks := fmt.Sprint(normalizeValue(k))
+			if _, ok := keyMap[ks]; !ok {
+				keyMap[ks] = k
+			}
+		}
+		union := make([]interface{}, 0, len(keyMap))
+		for _, v := range keyMap {
+			union = append(union, v)
+		}
+
+		srcAggByKey, err := c.getAggByKeys(c.sourceDB.DB, t.Source, keyCol, rowExpr, union)
+		if err != nil {
+			return err
+		}
+		tgtAggByKey, err := c.getAggByKeys(c.targetDB.DB, t.Target, keyCol, rowExpr, union)
+		if err != nil {
+			return err
+		}
+
+		for ks := range keyMap {
+			sa, sok := srcAggByKey[ks]
+			ta, tok := tgtAggByKey[ks]
+			result.ComparedKeys++
+			if !sok && tok {
+				result.TargetOnlyKeys++
+				continue
+			}
+			if sok && !tok {
+				result.SourceOnlyKeys++
+				continue
+			}
+			if !sok && !tok {
+				continue
+			}
+			if sa.cnt == ta.cnt && sa.sumCrc == ta.sumCrc && sa.xorCrc == ta.xorCrc {
+				result.MatchedKeys++
+			} else {
+				result.MismatchedKeys++
+			}
+		}
+		return nil
+	}
+
+	mid := len(keys) / 2
+	if mid <= 0 {
+		return nil
+	}
+	leftKeys := keys[:mid]
+	rightKeys := keys[mid:]
+
+	pivot := leftKeys[len(leftKeys)-1]
+
+	if err := c.compareChunkAndDrill(result, t, keyCol, keyType, rowExpr, startExclusive, pivot, leftKeys, distinct); err != nil {
+		return err
+	}
+	return c.compareChunkAndDrill(result, t, keyCol, keyType, rowExpr, pivot, endInclusive, rightKeys, distinct)
 }
 
 func (c *Comparator) getTableColumns(db *sql.DB, table string) ([]string, error) {

@@ -141,7 +141,9 @@ password: "${SOURCE_DB_PASSWORD}"
 - `auto_compare`：同步完成后自动执行对比
 - `compare_workers`：对比并发度
 - `count_only`：只比行数
-- `batch_keys`：全量比对时每批处理的 key 数（默认 1000）
+- `batch_keys`：chunk 校验时每批处理的 key 数（默认 1000）
+- `drill_threshold`：chunk 不一致时下钻的阈值（key 数），低于该阈值会进入逐 key 精确对比（默认 2000）
+- `checkpoint_file`：对比 checkpoint 文件路径（默认 `.mysql2ob-sync.compare.checkpoint.json`）
 - 无主键/唯一键的表：需要在 `tables` 里配置 `split_column`，对比时会按该列分批做全量一致性校验
 
 ### schema
