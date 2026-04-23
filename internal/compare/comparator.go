@@ -202,11 +202,7 @@ func (c *Comparator) chunkCompareByKeyColumn(result *CompareResult, t TablePair)
 
 	var last interface{} = nil
 	if c.checkpoints != nil {
-		if ck, ok := c.checkpoints.get(t.Source); ok && ck.Done && ck.KeyColumn == keyCol && ck.KeyType == keyType {
-			logger.Info("  [%s] Compare checkpoint done, skipping content comparison", t.Source)
-			return nil
-		}
-		if ck, ok := c.checkpoints.get(t.Source); ok && ck.LastKey != "" && ck.KeyColumn == keyCol && ck.KeyType == keyType {
+		if ck, ok := c.checkpoints.get(t.Source); ok && !ck.Done && ck.LastKey != "" && ck.KeyColumn == keyCol && ck.KeyType == keyType {
 			v, err := parseCheckpointKey(ck.LastKey, colType)
 			if err == nil {
 				last = v

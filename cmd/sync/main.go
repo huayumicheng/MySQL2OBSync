@@ -48,6 +48,16 @@ func main() {
 	if *countOnly {
 		*compareOnly = true
 	}
+	if strings.TrimSpace(*exportFixSQL) != "" {
+		if *countOnly {
+			fmt.Fprintf(os.Stderr, "--export-fix-sql 不能与 --count-only 一起使用（count-only 不做内容对比，无法生成订正SQL）\n")
+			os.Exit(2)
+		}
+		if !*compareOnly {
+			fmt.Fprintf(os.Stderr, "--export-fix-sql 必须配合 --compare-only 使用（避免进入数据同步流程）\n")
+			os.Exit(2)
+		}
+	}
 
 	exePath, err := os.Executable()
 	if err != nil {
