@@ -42,6 +42,9 @@ type Logger struct {
 	logFile    *os.File
 	fileOut    io.Writer
 	level      Level
+	logDir     string
+	sessionTS  string
+	tableFiles map[string]*os.File
 	mu         sync.Mutex
 }
 
@@ -93,9 +96,9 @@ func NewLoggerWithTag(logDir string, level Level, tag string) (*Logger, error) {
 		return nil, fmt.Errorf("create log dir failed: %w", err)
 	}
 
-	timestamp := time.Now().Format("20060102-150405")
+	sessionTS := time.Now().Format("20060102-150405")
 	tag = sanitizeLogTag(tag)
-	logFileName := fmt.Sprintf("mysql2ob-sync-%s-%s.log", timestamp, tag)
+	logFileName := fmt.Sprintf("mysql2ob-sync-%s-%s.log", sessionTS, tag)
 	logFilePath := filepath.Join(logDir, logFileName)
 
 	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -108,10 +111,19 @@ func NewLoggerWithTag(logDir string, level Level, tag string) (*Logger, error) {
 		logFile:    logFile,
 		fileOut:    logFile,
 		level:      level,
+		logDir:     logDir,
+		sessionTS:  sessionTS,
+		tableFiles: map[string]*os.File{},
 	}, nil
 }
 
 func (l *Logger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, f := range l.tableFiles {
+		_ = f.Close()
+	}
+	l.tableFiles = map[string]*os.File{}
 	if l.logFile != nil {
 		return l.logFile.Close()
 	}
@@ -142,6 +154,51 @@ func (l *Logger) log(level Level, format string, args ...interface{}) {
 	if l.fileOut != nil {
 		fmt.Fprint(l.fileOut, logLine)
 	}
+	if tag, ok := extractTableTag(message); ok {
+		l.writeTableLog(tag, logLine)
+	}
+}
+
+var tableTagPrefixRe = regexp.MustCompile(`^\s*\[([A-Za-z0-9_.$-]+)\]`)
+var compareTableRe = regexp.MustCompile(`^\s*Comparing table:\s*([A-Za-z0-9_.$-]+)\s*<->`)
+var syncingTableRe = regexp.MustCompile(`^\s*\[\d+/\d+\]\s*Syncing table:\s*([A-Za-z0-9_.$-]+)\s*->`)
+
+func extractTableTag(message string) (string, bool) {
+	if m := tableTagPrefixRe.FindStringSubmatch(message); len(m) == 2 {
+		return m[1], true
+	}
+	if m := compareTableRe.FindStringSubmatch(message); len(m) == 2 {
+		return m[1], true
+	}
+	if m := syncingTableRe.FindStringSubmatch(message); len(m) == 2 {
+		return m[1], true
+	}
+	return "", false
+}
+
+func (l *Logger) writeTableLog(tag, logLine string) {
+	if l.logDir == "" || l.sessionTS == "" {
+		return
+	}
+	tag = sanitizeLogTag(tag)
+	if tag == "" || tag == "all" {
+		return
+	}
+	if l.tableFiles == nil {
+		l.tableFiles = map[string]*os.File{}
+	}
+	f := l.tableFiles[tag]
+	if f == nil {
+		name := fmt.Sprintf("mysql2ob-sync-%s-table-%s.log", l.sessionTS, tag)
+		path := filepath.Join(l.logDir, name)
+		var err error
+		f, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			return
+		}
+		l.tableFiles[tag] = f
+	}
+	_, _ = f.WriteString(logLine)
 }
 
 func (l *Logger) Debug(format string, args ...interface{}) { l.log(DEBUG, format, args...) }
