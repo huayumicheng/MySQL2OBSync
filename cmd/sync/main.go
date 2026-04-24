@@ -34,7 +34,7 @@ func main() {
 		validateSchema = flag.Bool("validate-schema", false, "校验源端和目标端表结构")
 		dryRun         = flag.Bool("dry-run", false, "仅生成建表脚本，不执行")
 		genScript      = flag.String("gen-script", "", "生成建表脚本到指定文件")
-		logDir         = flag.String("log-dir", "", "日志目录（默认为可执行文件目录）")
+		logDir         = flag.String("log-dir", "", "日志目录（默认为./log）")
 		tableWorkers   = flag.Int("table-workers", 0, "并发同步表数量（配置文件中为sync.table_workers）")
 	)
 
@@ -59,24 +59,10 @@ func main() {
 		}
 	}
 
-	exePath, err := os.Executable()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to get executable path: %v\n", err)
-		os.Exit(1)
-	}
-	logPath := filepath.Dir(exePath)
-	if *logDir != "" {
-		logPath = *logDir
-	}
-	if err := logger.InitWithDir(logPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to init logger: %v\n", err)
-		os.Exit(1)
-	}
-	defer logger.Close()
-
 	cfg, err := config.LoadConfig(*configFile)
 	if err != nil {
-		logger.Fatal("Failed to load config: %v", err)
+		fmt.Fprintf(os.Stderr, "Failed to load config: %v\n", err)
+		os.Exit(1)
 	}
 
 	if *tableWorkers > 0 {
@@ -88,11 +74,6 @@ func main() {
 	if *compareOnly && !*countOnly {
 		cfg.Compare.CountOnly = false
 	}
-
-	logger.Info("MySQL to OceanBase(MySQL) Sync Tool v%s", version)
-	logger.Info("Job: %s", cfg.JobName)
-	logger.Info("Source: %s@%s:%d/%s", cfg.Source.Username, cfg.Source.Host, cfg.Source.Port, cfg.Source.Database)
-	logger.Info("Target: %s@%s:%d/%s", cfg.Target.Username, cfg.Target.Host, cfg.Target.Port, cfg.Target.Database)
 
 	if *tables != "" {
 		tableList := strings.Split(*tables, ",")
@@ -109,6 +90,23 @@ func main() {
 			})
 		}
 	}
+
+	logPath := ""
+	if strings.TrimSpace(*logDir) != "" {
+		logPath = filepath.Clean(*logDir)
+	} else {
+		logPath = filepath.Join(".", "log")
+	}
+	if err := logger.InitWithDirAndTag(logPath, buildTableTag(cfg.Tables)); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to init logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer logger.Close()
+
+	logger.Info("MySQL to OceanBase(MySQL) Sync Tool v%s", version)
+	logger.Info("Job: %s", cfg.JobName)
+	logger.Info("Source: %s@%s:%d/%s", cfg.Source.Username, cfg.Source.Host, cfg.Source.Port, cfg.Source.Database)
+	logger.Info("Target: %s@%s:%d/%s", cfg.Target.Username, cfg.Target.Host, cfg.Target.Port, cfg.Target.Database)
 
 	sourceDB, err := database.NewMySQLConnection(cfg.Source)
 	if err != nil {
@@ -138,6 +136,32 @@ func main() {
 	}
 
 	runSync(cfg, sourceDB, targetDB, *exportFixSQL)
+}
+
+func buildTableTag(tables []config.TableConfig) string {
+	if len(tables) == 0 {
+		return "all"
+	}
+	if len(tables) == 1 {
+		return strings.TrimSpace(tables[0].Source)
+	}
+	n := len(tables)
+	limit := 3
+	if n < limit {
+		limit = n
+	}
+	parts := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		v := strings.TrimSpace(tables[i].Source)
+		if v != "" {
+			parts = append(parts, v)
+		}
+	}
+	tag := strings.Join(parts, "_")
+	if n > limit {
+		tag = fmt.Sprintf("%s_multi%d", tag, n)
+	}
+	return tag
 }
 
 func runSync(cfg *config.Config, sourceDB, targetDB *database.Connection, exportFixSQLDir string) {

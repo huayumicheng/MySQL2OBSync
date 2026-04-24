@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 )
@@ -47,7 +48,7 @@ type Logger struct {
 var globalLogger *Logger
 
 func InitWithDir(logDir string) error {
-	l, err := NewLogger(logDir, INFO)
+	l, err := NewLoggerWithTag(logDir, INFO, "")
 	if err != nil {
 		return err
 	}
@@ -55,13 +56,46 @@ func InitWithDir(logDir string) error {
 	return nil
 }
 
+func InitWithDirAndTag(logDir, tag string) error {
+	l, err := NewLoggerWithTag(logDir, INFO, tag)
+	if err != nil {
+		return err
+	}
+	globalLogger = l
+	return nil
+}
+
+var logTagRe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+func sanitizeLogTag(tag string) string {
+	tag = logTagRe.ReplaceAllString(tag, "_")
+	for len(tag) > 0 && (tag[0] == '_' || tag[0] == '.' || tag[0] == '-') {
+		tag = tag[1:]
+	}
+	for len(tag) > 0 && (tag[len(tag)-1] == '_' || tag[len(tag)-1] == '.' || tag[len(tag)-1] == '-') {
+		tag = tag[:len(tag)-1]
+	}
+	if tag == "" {
+		return "all"
+	}
+	if len(tag) > 80 {
+		return tag[:80]
+	}
+	return tag
+}
+
 func NewLogger(logDir string, level Level) (*Logger, error) {
+	return NewLoggerWithTag(logDir, level, "")
+}
+
+func NewLoggerWithTag(logDir string, level Level, tag string) (*Logger, error) {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, fmt.Errorf("create log dir failed: %w", err)
 	}
 
 	timestamp := time.Now().Format("20060102-150405")
-	logFileName := fmt.Sprintf("mysql2ob-sync-%s.log", timestamp)
+	tag = sanitizeLogTag(tag)
+	logFileName := fmt.Sprintf("mysql2ob-sync-%s-%s.log", timestamp, tag)
 	logFilePath := filepath.Join(logDir, logFileName)
 
 	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
