@@ -145,8 +145,6 @@ func (l *Logger) log(level Level, format string, args ...interface{}) {
 
 	if tag, ok := extractTableTag(message); ok {
 		l.writeTableLog(tag, logLine)
-	} else {
-		l.writeTableLog("all", logLine)
 	}
 }
 
@@ -172,8 +170,8 @@ func (l *Logger) writeTableLog(tag, logLine string) {
 		return
 	}
 	tag = sanitizeLogTag(tag)
-	if tag == "" {
-		tag = "all"
+	if tag == "" || tag == "all" {
+		return
 	}
 	if l.tableFiles == nil {
 		l.tableFiles = map[string]*os.File{}
