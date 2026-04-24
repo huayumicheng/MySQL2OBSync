@@ -39,8 +39,6 @@ func (l Level) String() string {
 
 type Logger struct {
 	consoleOut io.Writer
-	logFile    *os.File
-	fileOut    io.Writer
 	level      Level
 	logDir     string
 	sessionTS  string
@@ -102,18 +100,9 @@ func NewLoggerWithJobName(logDir string, level Level, jobName string) (*Logger, 
 	if jobName == "" || jobName == "all" {
 		jobName = "mysql2ob-sync"
 	}
-	logFileName := fmt.Sprintf("%s_%s.log", jobName, sessionTS)
-	logFilePath := filepath.Join(logDir, logFileName)
-
-	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("open log file failed: %w", err)
-	}
 
 	return &Logger{
 		consoleOut: os.Stdout,
-		logFile:    logFile,
-		fileOut:    logFile,
 		level:      level,
 		logDir:     logDir,
 		sessionTS:  sessionTS,
@@ -129,9 +118,6 @@ func (l *Logger) Close() error {
 		_ = f.Close()
 	}
 	l.tableFiles = map[string]*os.File{}
-	if l.logFile != nil {
-		return l.logFile.Close()
-	}
 	return nil
 }
 
@@ -156,11 +142,11 @@ func (l *Logger) log(level Level, format string, args ...interface{}) {
 	if l.consoleOut != nil {
 		fmt.Fprint(l.consoleOut, logLine)
 	}
-	if l.fileOut != nil {
-		fmt.Fprint(l.fileOut, logLine)
-	}
+
 	if tag, ok := extractTableTag(message); ok {
 		l.writeTableLog(tag, logLine)
+	} else {
+		l.writeTableLog("all", logLine)
 	}
 }
 
@@ -186,8 +172,8 @@ func (l *Logger) writeTableLog(tag, logLine string) {
 		return
 	}
 	tag = sanitizeLogTag(tag)
-	if tag == "" || tag == "all" {
-		return
+	if tag == "" {
+		tag = "all"
 	}
 	if l.tableFiles == nil {
 		l.tableFiles = map[string]*os.File{}
