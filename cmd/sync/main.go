@@ -101,7 +101,11 @@ func main() {
 	if jobName == "" {
 		jobName = "mysql2ob-sync"
 	}
-	if err := logger.InitWithDirAndJobName(logPath, jobName); err != nil {
+	tableName := ""
+	if len(cfg.Tables) == 1 {
+		tableName = cfg.Tables[0].Source
+	}
+	if err := logger.InitWithDirJobNameAndTable(logPath, jobName, tableName); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to init logger: %v\n", err)
 		os.Exit(1)
 	}

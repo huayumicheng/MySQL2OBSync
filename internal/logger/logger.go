@@ -38,19 +38,20 @@ func (l Level) String() string {
 }
 
 type Logger struct {
-	consoleOut io.Writer
-	level      Level
-	logDir     string
-	sessionTS  string
-	jobName    string
-	tableFiles map[string]*os.File
-	mu         sync.Mutex
+	consoleOut   io.Writer
+	level        Level
+	logDir       string
+	sessionTS    string
+	jobName      string
+	singleTable  string
+	tableFiles   map[string]*os.File
+	mu           sync.Mutex
 }
 
 var globalLogger *Logger
 
 func InitWithDir(logDir string) error {
-	l, err := NewLoggerWithJobName(logDir, INFO, "mysql2ob-sync")
+	l, err := NewLoggerWithJobName(logDir, INFO, "mysql2ob-sync", "")
 	if err != nil {
 		return err
 	}
@@ -59,7 +60,16 @@ func InitWithDir(logDir string) error {
 }
 
 func InitWithDirAndJobName(logDir, jobName string) error {
-	l, err := NewLoggerWithJobName(logDir, INFO, jobName)
+	l, err := NewLoggerWithJobName(logDir, INFO, jobName, "")
+	if err != nil {
+		return err
+	}
+	globalLogger = l
+	return nil
+}
+
+func InitWithDirJobNameAndTable(logDir, jobName, tableName string) error {
+	l, err := NewLoggerWithJobName(logDir, INFO, jobName, tableName)
 	if err != nil {
 		return err
 	}
@@ -87,10 +97,10 @@ func sanitizeLogTag(tag string) string {
 }
 
 func NewLogger(logDir string, level Level) (*Logger, error) {
-	return NewLoggerWithJobName(logDir, level, "mysql2ob-sync")
+	return NewLoggerWithJobName(logDir, level, "mysql2ob-sync", "")
 }
 
-func NewLoggerWithJobName(logDir string, level Level, jobName string) (*Logger, error) {
+func NewLoggerWithJobName(logDir string, level Level, jobName, singleTable string) (*Logger, error) {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, fmt.Errorf("create log dir failed: %w", err)
 	}
@@ -100,14 +110,16 @@ func NewLoggerWithJobName(logDir string, level Level, jobName string) (*Logger, 
 	if jobName == "" || jobName == "all" {
 		jobName = "mysql2ob-sync"
 	}
+	singleTable = sanitizeLogTag(singleTable)
 
 	return &Logger{
-		consoleOut: os.Stdout,
-		level:      level,
-		logDir:     logDir,
-		sessionTS:  sessionTS,
-		jobName:    jobName,
-		tableFiles: map[string]*os.File{},
+		consoleOut:  os.Stdout,
+		level:       level,
+		logDir:      logDir,
+		sessionTS:   sessionTS,
+		jobName:     jobName,
+		singleTable: singleTable,
+		tableFiles:  map[string]*os.File{},
 	}, nil
 }
 
@@ -143,7 +155,9 @@ func (l *Logger) log(level Level, format string, args ...interface{}) {
 		fmt.Fprint(l.consoleOut, logLine)
 	}
 
-	if tag, ok := extractTableTag(message); ok {
+	if l.singleTable != "" {
+		l.writeTableLog(l.singleTable, logLine)
+	} else if tag, ok := extractTableTag(message); ok {
 		l.writeTableLog(tag, logLine)
 	}
 }
