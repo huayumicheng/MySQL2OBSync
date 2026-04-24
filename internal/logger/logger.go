@@ -44,6 +44,7 @@ type Logger struct {
 	level      Level
 	logDir     string
 	sessionTS  string
+	jobName    string
 	tableFiles map[string]*os.File
 	mu         sync.Mutex
 }
@@ -51,7 +52,7 @@ type Logger struct {
 var globalLogger *Logger
 
 func InitWithDir(logDir string) error {
-	l, err := NewLoggerWithTag(logDir, INFO, "")
+	l, err := NewLoggerWithJobName(logDir, INFO, "mysql2ob-sync")
 	if err != nil {
 		return err
 	}
@@ -59,8 +60,8 @@ func InitWithDir(logDir string) error {
 	return nil
 }
 
-func InitWithDirAndTag(logDir, tag string) error {
-	l, err := NewLoggerWithTag(logDir, INFO, tag)
+func InitWithDirAndJobName(logDir, jobName string) error {
+	l, err := NewLoggerWithJobName(logDir, INFO, jobName)
 	if err != nil {
 		return err
 	}
@@ -88,17 +89,20 @@ func sanitizeLogTag(tag string) string {
 }
 
 func NewLogger(logDir string, level Level) (*Logger, error) {
-	return NewLoggerWithTag(logDir, level, "")
+	return NewLoggerWithJobName(logDir, level, "mysql2ob-sync")
 }
 
-func NewLoggerWithTag(logDir string, level Level, tag string) (*Logger, error) {
+func NewLoggerWithJobName(logDir string, level Level, jobName string) (*Logger, error) {
 	if err := os.MkdirAll(logDir, 0755); err != nil {
 		return nil, fmt.Errorf("create log dir failed: %w", err)
 	}
 
 	sessionTS := time.Now().Format("20060102-150405")
-	tag = sanitizeLogTag(tag)
-	logFileName := fmt.Sprintf("mysql2ob-sync-%s-%s.log", sessionTS, tag)
+	jobName = sanitizeLogTag(jobName)
+	if jobName == "" || jobName == "all" {
+		jobName = "mysql2ob-sync"
+	}
+	logFileName := fmt.Sprintf("%s_%s.log", jobName, sessionTS)
 	logFilePath := filepath.Join(logDir, logFileName)
 
 	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -113,6 +117,7 @@ func NewLoggerWithTag(logDir string, level Level, tag string) (*Logger, error) {
 		level:      level,
 		logDir:     logDir,
 		sessionTS:  sessionTS,
+		jobName:    jobName,
 		tableFiles: map[string]*os.File{},
 	}, nil
 }
@@ -177,7 +182,7 @@ func extractTableTag(message string) (string, bool) {
 }
 
 func (l *Logger) writeTableLog(tag, logLine string) {
-	if l.logDir == "" || l.sessionTS == "" {
+	if l.logDir == "" || l.sessionTS == "" || l.jobName == "" {
 		return
 	}
 	tag = sanitizeLogTag(tag)
@@ -189,7 +194,7 @@ func (l *Logger) writeTableLog(tag, logLine string) {
 	}
 	f := l.tableFiles[tag]
 	if f == nil {
-		name := fmt.Sprintf("mysql2ob-sync-%s-table-%s.log", l.sessionTS, tag)
+		name := fmt.Sprintf("%s_%s_%s.log", l.jobName, l.sessionTS, tag)
 		path := filepath.Join(l.logDir, name)
 		var err error
 		f, err = os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)

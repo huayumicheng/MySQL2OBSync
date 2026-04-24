@@ -97,7 +97,11 @@ func main() {
 	} else {
 		logPath = filepath.Join(".", "log")
 	}
-	if err := logger.InitWithDirAndTag(logPath, buildTableTag(cfg.Tables)); err != nil {
+	jobName := cfg.JobName
+	if jobName == "" {
+		jobName = "mysql2ob-sync"
+	}
+	if err := logger.InitWithDirAndJobName(logPath, jobName); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to init logger: %v\n", err)
 		os.Exit(1)
 	}
